@@ -113,7 +113,8 @@ fun PresetDialog(
                         carrierHz = carrier.toDouble(),
                         durationMinutes = duration,
                         soundMode = selectedMode.name,
-                        enablePinkNoise = enablePinkNoise
+                        // The switch is only shown for Hemi-Sync; don't persist a hidden "on" for other modes.
+                        enablePinkNoise = selectedMode == SoundMode.HEMI_SYNC && enablePinkNoise
                     )
                     onSave(newPreset)
                 }

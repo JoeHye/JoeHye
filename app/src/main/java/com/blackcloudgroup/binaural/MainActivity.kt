@@ -17,11 +17,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import com.blackcloudgroup.binaural.audio.ToneParams
+import com.blackcloudgroup.binaural.audio.parseSoundMode
 import com.blackcloudgroup.binaural.data.AppDatabase
 import com.blackcloudgroup.binaural.data.PresetEntity
 import com.blackcloudgroup.binaural.ui.LissajousVisualizer
@@ -29,8 +32,9 @@ import com.blackcloudgroup.binaural.ui.PhoticEntrainmentCanvas
 import com.blackcloudgroup.binaural.ui.PresetDialog
 import com.blackcloudgroup.binaural.util.WavExporter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
-import java.io.File
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -96,15 +100,49 @@ fun MainAppContent(
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val presets by database.presetDao().getAllPresets().collectAsState(initial = emptyList())
+    // remember the Flow so recomposition (e.g. every slider tick) doesn't re-run the Room query
+    val presetsFlow = remember(database) { database.presetDao().getAllPresets() }
+    val presets by presetsFlow.collectAsState(initial = emptyList())
 
-    var isPlaying by remember { mutableStateOf(false) }
-    var carrier by remember { mutableFloatStateOf(200f) }
-    var beat by remember { mutableFloatStateOf(6f) }
-    var soundMode by remember { mutableStateOf(SoundMode.HEMI_SYNC) }
-    var enablePhotic by remember { mutableStateOf(false) }
+    // Playback state comes from the service, so focus loss, notification Stop, session end and
+    // activity recreation are all reflected here instead of a local flag drifting out of sync.
+    val playbackFlow = remember(audioService) {
+        audioService?.playbackState ?: MutableStateFlow<PlaybackState>(PlaybackState.Idle)
+    }
+    val playback by playbackFlow.collectAsState()
+    val isPlaying = playback is PlaybackState.Playing
+
+    var carrier by rememberSaveable { mutableFloatStateOf(200f) }
+    var beat by rememberSaveable { mutableFloatStateOf(6f) }
+    // Ramp/duration/pink noise come from the last tapped preset. null target = no ramp; 0 minutes = open-ended.
+    var rampTargetBeat by rememberSaveable { mutableStateOf<Float?>(null) }
+    var durationMinutes by rememberSaveable { mutableIntStateOf(0) }
+    var pinkNoise by rememberSaveable { mutableStateOf(true) }
+    var soundMode by rememberSaveable { mutableStateOf(SoundMode.HEMI_SYNC) }
+    var enablePhotic by rememberSaveable { mutableStateOf(false) }
     var showPresetDialog by remember { mutableStateOf(false) }
     var presetToDelete by remember { mutableStateOf<PresetEntity?>(null) }
+    var exportInProgress by remember { mutableStateOf(false) }
+
+    fun currentParams() = ToneParams(
+        carrierHz = carrier.toDouble(),
+        startBeatHz = beat.toDouble(),
+        targetBeatHz = (rampTargetBeat ?: beat).toDouble(),
+        durationSeconds = durationMinutes * 60,
+        soundMode = soundMode,
+        pinkNoise = pinkNoise
+    )
+
+    /** Push the UI's parameters to a running session; invalid combinations are logged and skipped. */
+    fun pushParams(restartTimeline: Boolean = false) {
+        val service = audioService ?: return
+        if (!isPlaying) return
+        try {
+            service.updateParams(currentParams(), restartTimeline)
+        } catch (e: IllegalArgumentException) {
+            Log.w("MainActivity", "Not applying invalid parameters: ${e.message}")
+        }
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         PhoticEntrainmentCanvas(beatFreqHz = beat.toDouble(), isEnabled = enablePhotic && isPlaying)
@@ -137,7 +175,7 @@ fun MainAppContent(
                     selected = soundMode == SoundMode.HEMI_SYNC,
                     onClick = {
                         soundMode = SoundMode.HEMI_SYNC
-                        audioService?.soundMode = SoundMode.HEMI_SYNC
+                        pushParams()
                     },
                     label = { Text("Hemi-Sync") }
                 )
@@ -145,7 +183,7 @@ fun MainAppContent(
                     selected = soundMode == SoundMode.BINAURAL,
                     onClick = {
                         soundMode = SoundMode.BINAURAL
-                        audioService?.soundMode = SoundMode.BINAURAL
+                        pushParams()
                     },
                     label = { Text("Binaural") }
                 )
@@ -153,7 +191,7 @@ fun MainAppContent(
                     selected = soundMode == SoundMode.ISOCHRONIC,
                     onClick = {
                         soundMode = SoundMode.ISOCHRONIC
-                        audioService?.soundMode = SoundMode.ISOCHRONIC
+                        pushParams()
                     },
                     label = { Text("Isochronic") }
                 )
@@ -166,17 +204,23 @@ fun MainAppContent(
                 value = carrier,
                 onValueChange = {
                     carrier = it
-                    audioService?.carrierFreq = it.toDouble()
+                    pushParams()
                 },
                 valueRange = 100f..500f
             )
 
-            Text("Binaural Beat: ${String.format("%.1f", beat)} Hz")
+            Text(
+                "Binaural Beat: ${String.format("%.1f", beat)} Hz" +
+                    (rampTargetBeat?.let { " → ${String.format("%.1f", it)} Hz" } ?: "") +
+                    (if (durationMinutes > 0) " over $durationMinutes min" else "")
+            )
             Slider(
                 value = beat,
                 onValueChange = {
+                    // Moving the beat by hand overrides the preset ramp (duration still applies).
                     beat = it
-                    audioService?.beatFreq = it.toDouble()
+                    rampTargetBeat = null
+                    pushParams()
                 },
                 valueRange = 0.5f..40f
             )
@@ -207,16 +251,31 @@ fun MainAppContent(
                         }
 
                         if (isPlaying) {
-                            service.stopAudio()
-                            isPlaying = false
-                        } else {
-                            val intent = Intent(context, BinauralAudioService::class.java)
-                            context.startForegroundService(intent)
-                            service.carrierFreq = carrier.toDouble()
-                            service.beatFreq = beat.toDouble()
-                            service.soundMode = soundMode
-                            service.startAudio()
-                            isPlaying = true
+                            service.stopSession()
+                            return@Button
+                        }
+
+                        val params = try {
+                            currentParams()
+                        } catch (e: IllegalArgumentException) {
+                            Log.w("MainActivity", "Refusing to start with invalid parameters", e)
+                            Toast.makeText(context, "Invalid settings: ${e.message}", Toast.LENGTH_LONG).show()
+                            return@Button
+                        }
+                        when (val result = service.startSession(params)) {
+                            SessionStartResult.Started -> Unit
+                            SessionStartResult.AlreadyPlaying ->
+                                Log.w("MainActivity", "Start tapped while service reports a running session")
+                            SessionStartResult.FocusDenied ->
+                                Toast.makeText(
+                                    context,
+                                    "Can't play right now — another app or a call is using audio.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            is SessionStartResult.Failed -> {
+                                Log.e("MainActivity", "Session start failed: ${result.message}", result.cause)
+                                Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                            }
                         }
                     },
                     modifier = Modifier.weight(1f)
@@ -230,6 +289,24 @@ fun MainAppContent(
 
                 OutlinedButton(onClick = { showPresetDialog = true }) {
                     Text("Save Preset")
+                }
+            }
+
+            (playback as? PlaybackState.Stopped)?.let { stopped ->
+                val status = when (stopped.reason) {
+                    StopReason.USER -> null
+                    StopReason.COMPLETED -> "Session complete."
+                    StopReason.FOCUS_LOSS -> "Stopped: ${stopped.message ?: "audio focus lost"}"
+                    StopReason.ERROR -> "Playback error: ${stopped.message ?: "unknown"}"
+                }
+                if (status != null) {
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (stopped.reason == StopReason.ERROR) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
                 }
             }
 
@@ -251,17 +328,12 @@ fun MainAppContent(
                         onClick = {
                             carrier = preset.carrierHz.toFloat()
                             beat = preset.startBeatHz.toFloat()
-                            soundMode = try {
-                                SoundMode.valueOf(preset.soundMode)
-                            } catch (e: IllegalArgumentException) {
-                                SoundMode.BINAURAL
-                            }
-
-                            audioService?.let { service ->
-                                service.carrierFreq = preset.carrierHz
-                                service.beatFreq = preset.startBeatHz
-                                service.soundMode = soundMode
-                            }
+                            rampTargetBeat = preset.targetBeatHz.toFloat().takeIf { it != beat }
+                            durationMinutes = preset.durationMinutes
+                            pinkNoise = preset.enablePinkNoise
+                            soundMode = parseSoundMode(preset.soundMode)
+                            // A new preset starts its ramp and duration from the beginning.
+                            pushParams(restartTimeline = true)
                         }
                     ) {
                         Row(
@@ -280,12 +352,17 @@ fun MainAppContent(
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(
+                                    enabled = !exportInProgress,
                                     onClick = {
-                                        coroutineScope.launch(Dispatchers.IO) {
+                                        exportInProgress = true
+                                        Toast.makeText(context, "Exporting ${preset.title}…", Toast.LENGTH_SHORT).show()
+                                        coroutineScope.launch {
                                             try {
-                                                val outFile = File(context.cacheDir, "${preset.title.replace(" ", "_")}.wav")
-                                                WavExporter.exportToWav(context, preset, outFile)
-                                                launch(Dispatchers.Main) {
+                                                val outFile = WavExporter.exportToWav(
+                                                    preset,
+                                                    WavExporter.exportFileFor(context, preset)
+                                                )
+                                                withContext(Dispatchers.Main) {
                                                     try {
                                                         val uri = FileProvider.getUriForFile(
                                                             context,
@@ -303,11 +380,14 @@ fun MainAppContent(
                                                         Toast.makeText(context, "Exported to ${outFile.name}, but sharing failed", Toast.LENGTH_SHORT).show()
                                                     }
                                                 }
+                                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                                Log.i("MainActivity", "WAV export cancelled for '${preset.title}'")
+                                                throw e
                                             } catch (e: Exception) {
                                                 Log.e("MainActivity", "Failed to export WAV file", e)
-                                                launch(Dispatchers.Main) {
-                                                    Toast.makeText(context, "Export failed: ${e.localizedMessage ?: "Unknown error"}", Toast.LENGTH_LONG).show()
-                                                }
+                                                Toast.makeText(context, "Export failed: ${e.localizedMessage ?: "Unknown error"}", Toast.LENGTH_LONG).show()
+                                            } finally {
+                                                exportInProgress = false
                                             }
                                         }
                                     }
