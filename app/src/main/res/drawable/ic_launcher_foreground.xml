@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Placeholder mark: two offset rings (left/right ear tones). Replace with the real brand icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FF3B82F6"
+        android:strokeWidth="4"
+        android:pathData="M46,54m-14,0a14,14 0,1 1,28 0a14,14 0,1 1,-28 0" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FF22D3EE"
+        android:strokeWidth="4"
+        android:pathData="M62,54m-14,0a14,14 0,1 1,28 0a14,14 0,1 1,-28 0" />
+</vector>
