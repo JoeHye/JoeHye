@@ -13,8 +13,10 @@ import android.os.IBinder
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -85,6 +87,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // targetSdk 35+ always draws edge-to-edge. The Compose theme is always light, so force dark
+        // system-bar icons; the automatic style would pick light icons in system dark mode and
+        // make them invisible on our light background.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+        )
         val database = AppDatabase.getDatabase(this)
         showPrivacyInfo = isPrivacyIntent(intent)
 
@@ -317,7 +326,13 @@ fun MainAppContent(
     Box(modifier = Modifier.fillMaxSize()) {
         PhoticEntrainmentCanvas(beatFreqHz = beat.toDouble(), isEnabled = enablePhotic && isPlaying)
 
-        Column(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                // Keep content out from under the status bar and side cutouts; the bottom bar
+                // handles the navigation bar itself so its background still reaches the edge.
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
+        ) {
             // Everything scrolls except the bottom bar, so Start/Stop is always reachable
             // regardless of screen height or the system font size.
             LazyColumn(

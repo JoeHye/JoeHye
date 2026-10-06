@@ -1,0 +1,70 @@
+name: Release bundle
+
+# Builds the Play Store bundle (.aab) with R8 shrinking.
+# - Tag push v*: must be signed; fails if the signing secrets are missing.
+# - Manual run: signed if the secrets exist, otherwise unsigned (useful to check the release build).
+# Setup steps: docs/RELEASING.md
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare upload key
+        id: key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64}" ]; then
+            if [ "${IS_TAG}" = "true" ]; then
+              echo "::error::RELEASE_KEYSTORE_BASE64 secret is not set; refusing to build an unsigned bundle for a release tag. See docs/RELEASING.md."
+              exit 1
+            fi
+            echo "::warning::No signing secrets configured; building an UNSIGNED bundle (cannot be uploaded to Play)."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keystore="$RUNNER_TEMP/upload-keystore.jks"
+          if ! echo "${KEYSTORE_BASE64}" | base64 --decode > "$keystore"; then
+            echo "::error::RELEASE_KEYSTORE_BASE64 is not valid base64."
+            exit 1
+          fi
+          echo "RELEASE_KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build release bundle
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew bundleRelease --stacktrace
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.key.outputs.signed == 'true' && 'release-aab-signed' || 'release-aab-UNSIGNED' }}
+          path: app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+      - name: Upload R8 mapping (needed to read release crash stack traces)
+        uses: actions/upload-artifact@v4
+        with:
+          name: r8-mapping
+          path: app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn

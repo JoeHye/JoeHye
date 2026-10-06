@@ -12,8 +12,9 @@ android {
     defaultConfig {
         applicationId = "com.blackcloudgroup.binaural"
         minSdk = 26
-        targetSdk = 34
-        versionCode = 1
+        targetSdk = 36
+        // CI passes the run number so every uploaded bundle has a higher versionCode (Play requires it).
+        versionCode = System.getenv("VERSION_CODE")?.takeIf { it.isNotEmpty() }?.toInt() ?: 1
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -31,10 +32,27 @@ android {
             keyAlias = "androiddebugkey"
             keyPassword = "android"
         }
+
+        // Upload key for Play, supplied only by the release CI job (see docs/RELEASING.md).
+        // Absent locally and in normal CI, in which case release builds are left unsigned.
+        // CI passes missing secrets as empty strings, so treat empty the same as unset.
+        val keystorePath = System.getenv("RELEASE_KEYSTORE_PATH")?.takeIf { it.isNotEmpty() }
+        if (keystorePath != null) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")?.takeIf { it.isNotEmpty() }
+                    ?: error("RELEASE_KEYSTORE_PASSWORD must be set when RELEASE_KEYSTORE_PATH is")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")?.takeIf { it.isNotEmpty() }
+                    ?: error("RELEASE_KEY_ALIAS must be set when RELEASE_KEYSTORE_PATH is")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")?.takeIf { it.isNotEmpty() }
+                    ?: error("RELEASE_KEY_PASSWORD must be set when RELEASE_KEYSTORE_PATH is")
+            }
+        }
     }
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
