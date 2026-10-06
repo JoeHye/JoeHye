@@ -1,3 +1,6 @@
+// Mindfulness session records are still marked experimental in connect-client 1.1.0.
+@file:OptIn(ExperimentalMindfulnessSessionApi::class)
+
 package com.blackcloudgroup.binaural.health
 
 import android.content.Context
@@ -6,6 +9,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.HealthConnectFeatures
+import androidx.health.connect.client.feature.ExperimentalMindfulnessSessionApi
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.MindfulnessSessionRecord
 import androidx.health.connect.client.records.metadata.Device
