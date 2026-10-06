@@ -125,6 +125,7 @@ fun MainAppContent(
     var pinkNoise by rememberSaveable { mutableStateOf(true) }
     var soundMode by rememberSaveable { mutableStateOf(SoundMode.HEMI_SYNC) }
     var enablePhotic by rememberSaveable { mutableStateOf(false) }
+    var exportInProgress by remember { mutableStateOf(false) }
     var showPhoticWarning by remember { mutableStateOf(false) }
     // Linear output gain sent to the service; Android's media volume still applies on top of it.
     var volume by rememberSaveable { mutableFloatStateOf(DEFAULT_VOLUME) }
@@ -192,7 +193,6 @@ fun MainAppContent(
     }
     var showPresetDialog by remember { mutableStateOf(false) }
     var presetToDelete by remember { mutableStateOf<PresetEntity?>(null) }
-    var exportInProgress by remember { mutableStateOf(false) }
 
     fun currentParams() = ToneParams(
         carrierHz = carrier.toDouble(),
