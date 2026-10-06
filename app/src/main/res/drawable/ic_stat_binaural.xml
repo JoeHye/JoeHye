@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Notification small icon: white silhouette of the app icon (status bar icons must be single colour). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M12,3 A9,9 0 1,1 3,12" />
+    <group android:pivotX="12" android:pivotY="12" android:rotation="-20">
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="1.6"
+            android:pathData="M6.5,12 A5.5,3 0 1,0 17.5,12 A5.5,3 0 1,0 6.5,12" />
+    </group>
+</vector>

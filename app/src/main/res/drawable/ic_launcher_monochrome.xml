@@ -1,37 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The now-playing hero: a progress ring (track + 3/4 cyan arc) around two crossing ellipses.
-     108dp adaptive canvas; artwork stays inside the 66dp safe zone (21..87). -->
+<!-- Android 13+ themed icon: single colour, tinted by the system. Same shapes as the foreground. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- ring track -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#FF1E2840"
-        android:strokeWidth="4"
-        android:pathData="M54,28 A26,26 0 1,1 54,80 A26,26 0 1,1 54,28" />
-    <!-- progress arc: top, clockwise three quarters -->
-    <path
-        android:fillColor="#00000000"
-        android:strokeColor="#FF7DD3E8"
+        android:strokeColor="#FFFFFFFF"
         android:strokeWidth="4"
         android:strokeLineCap="round"
         android:pathData="M54,28 A26,26 0 1,1 28,54" />
-    <!-- crossing ellipses (the visualizer) -->
     <group android:pivotX="54" android:pivotY="54" android:rotation="-20">
         <path
             android:fillColor="#00000000"
-            android:strokeColor="#FF7DD3E8"
-            android:strokeWidth="2"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.5"
             android:pathData="M37,54 A17,9 0 1,0 71,54 A17,9 0 1,0 37,54" />
     </group>
     <group android:pivotX="54" android:pivotY="54" android:rotation="25">
         <path
             android:fillColor="#00000000"
-            android:strokeColor="#997DD3E8"
-            android:strokeWidth="2"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.5"
             android:pathData="M37,54 A17,9 0 1,0 71,54 A17,9 0 1,0 37,54" />
     </group>
 </vector>

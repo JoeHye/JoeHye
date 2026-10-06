@@ -17,6 +17,7 @@ fun SettingsSheet(
     onLogToHealthConnectChange: (Boolean) -> Unit,
     healthStatus: StatusLine?,
     onRestoreDefaults: () -> Unit,
+    onOpenPrivacyPolicy: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val colors = MaterialTheme.colorScheme
@@ -78,6 +79,10 @@ fun SettingsSheet(
                 OutlinedButton(onClick = onRestoreDefaults, modifier = Modifier.padding(top = 8.dp)) {
                     Text("Restore built-in presets")
                 }
+            }
+
+            TextButton(onClick = onOpenPrivacyPolicy, contentPadding = PaddingValues(0.dp)) {
+                Text("Privacy policy")
             }
         }
     }

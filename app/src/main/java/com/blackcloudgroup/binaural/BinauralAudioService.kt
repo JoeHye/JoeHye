@@ -649,7 +649,7 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(s?.title ?: "Black Cloud Binaural")
             .setContentText(if (paused) pausedText(s?.pauseReason) else "Playing")
-            .setSmallIcon(if (paused) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_stat_binaural)
             .setContentIntent(openApp)
             .addAction(toggle)
             .addAction(stop)

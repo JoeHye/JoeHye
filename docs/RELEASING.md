@@ -65,3 +65,16 @@ from `app/build.gradle.kts` (bump it for user-visible versions).
 | `RELEASE_..._PASSWORD must be set when RELEASE_KEYSTORE_PATH is` | Keystore secret present but a password/alias secret is missing or empty |
 | `Keystore was tampered with, or password was incorrect` | Wrong `RELEASE_KEYSTORE_PASSWORD` |
 | `Cannot recover key` | Wrong `RELEASE_KEY_PASSWORD` |
+
+## Privacy policy (required for Play, and for Health Connect)
+
+The policy lives in `docs/privacy/index.html` and is linked from the app (Settings → Privacy policy, and the
+Health Connect explanation) at `https://joehye.github.io/JoeHye/privacy/`.
+
+1. Fill in the two placeholders in `docs/privacy/index.html`: `[EFFECTIVE DATE]` and `[CONTACT EMAIL]`
+   (an address you're happy to publish; Play shows it publicly too).
+2. After the work is merged to `main`: repository **Settings → Pages → Build and deployment →
+   Source: Deploy from a branch → Branch: `main`, folder `/docs` → Save**. The page is live within a few minutes.
+3. Use that URL in Play Console (**App content → Privacy policy**) and in the Health Connect declaration.
+
+If the repository is renamed or moved, update `PRIVACY_POLICY_URL` in `MainActivity.kt` to match.

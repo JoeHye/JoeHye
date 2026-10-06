@@ -60,6 +60,13 @@ android {
                 "proguard-rules.pro"
             )
         }
+        // Release code (R8 shrinking and obfuscation) signed with the debug key, so it installs from the
+        // latest-debug link and over the debug build. Catches release-only crashes before Play does.
+        create("qa") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

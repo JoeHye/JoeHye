@@ -614,6 +614,7 @@ fun MainAppContent(
                 onLogToHealthConnectChange = { wantOn -> if (wantOn) enableHealthLogging() else setHealthLogging(false) },
                 healthStatus = healthStatusLine,
                 onRestoreDefaults = { restoreDefaultPresets() },
+                onOpenPrivacyPolicy = { openPrivacyPolicy(context) },
                 onDismiss = { showSettings = false }
             )
         }
@@ -686,7 +687,8 @@ fun MainAppContent(
                             "Health Connect settings, or delete the entries there at any time."
                     )
                 },
-                confirmButton = { TextButton(onClick = onDismissPrivacyInfo) { Text("OK") } }
+                confirmButton = { TextButton(onClick = onDismissPrivacyInfo) { Text("OK") } },
+                dismissButton = { TextButton(onClick = { openPrivacyPolicy(context) }) { Text("Full privacy policy") } }
             )
         }
 
@@ -779,3 +781,15 @@ private fun SoundMode.label(): String = when (this) {
 }
 
 private enum class Screen { HOME, CUSTOMIZE }
+
+/** Published from docs/privacy via GitHub Pages (see docs/RELEASING.md). */
+const val PRIVACY_POLICY_URL = "https://joehye.github.io/JoeHye/privacy/"
+
+private fun openPrivacyPolicy(context: android.content.Context) {
+    try {
+        context.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(PRIVACY_POLICY_URL)))
+    } catch (e: ActivityNotFoundException) {
+        Log.w("MainActivity", "No browser to open the privacy policy", e)
+        Toast.makeText(context, "No browser found. The policy is at $PRIVACY_POLICY_URL", Toast.LENGTH_LONG).show()
+    }
+}
