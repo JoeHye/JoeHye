@@ -1,0 +1,77 @@
+name: Android build
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+# One build per branch at a time; a newer push cancels the older run so the
+# release link never ends up pointing at a stale build.
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write   # needed to publish the latest-debug release
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug + QA APKs and run unit tests
+        run: ./gradlew assembleDebug assembleQa testDebugUnitTest --stacktrace
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Upload QA APK and its R8 mapping
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-qa-apk
+          path: |
+            app/build/outputs/apk/qa/*.apk
+            app/build/outputs/mapping/qa/mapping.txt
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+
+      # Stable phone-friendly link: https://github.com/<owner>/<repo>/releases/download/latest-debug/black-cloud-binaural-debug.apk
+      - name: Publish latest-debug release
+        if: success() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          apk="black-cloud-binaural-debug.apk"
+          qa="black-cloud-binaural-qa.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$apk"
+          cp app/build/outputs/apk/qa/app-qa.apk "$qa"
+          # Recreate so the tag moves to this commit; a missing release on first run is expected.
+          if gh release view latest-debug >/dev/null 2>&1; then
+            gh release delete latest-debug --yes --cleanup-tag
+          fi
+          gh release create latest-debug "$apk" "$qa" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Latest debug build" \
+            --notes "Test builds of ${GITHUB_REF_NAME} at ${GITHUB_SHA::7} (run ${GITHUB_RUN_NUMBER}). debug = everyday testing; qa = release code (R8-shrunk) signed with the test key, to catch release-only problems. Not for distribution."

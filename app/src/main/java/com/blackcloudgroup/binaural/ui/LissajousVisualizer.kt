@@ -3,10 +3,10 @@ package com.blackcloudgroup.binaural.ui
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
@@ -32,6 +32,10 @@ fun LissajousVisualizer(
         }
     }
 
+    // Theme colours so the drawing stays visible in both light and night themes.
+    val lineColor = MaterialTheme.colorScheme.primary
+    val idleColor = MaterialTheme.colorScheme.outline
+
     Canvas(modifier = modifier) {
         val width = size.width
         val height = size.height
@@ -41,7 +45,7 @@ fun LissajousVisualizer(
 
         if (!isPlaying) {
             drawCircle(
-                color = Color.DarkGray,
+                color = idleColor,
                 radius = radius,
                 center = Offset(centerX, centerY),
                 style = Stroke(width = 2f)
@@ -70,7 +74,7 @@ fun LissajousVisualizer(
 
         drawPath(
             path = path,
-            color = Color(0xFF3B82F6),
+            color = lineColor,
             style = Stroke(width = 3f)
         )
     }
