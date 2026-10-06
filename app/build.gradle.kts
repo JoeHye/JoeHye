@@ -80,7 +80,7 @@ dependencies {
     ksp("androidx.room:room-compiler:2.6.1")
 
     // Health Connect Client
-    implementation("androidx.health.connect:connect-client:1.1.0-alpha11")
+    implementation("androidx.health.connect:connect-client:1.1.0")
 
     // MediaSession
     implementation("androidx.media:media:1.7.0")

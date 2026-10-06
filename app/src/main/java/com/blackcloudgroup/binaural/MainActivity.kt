@@ -1,6 +1,7 @@
 package com.blackcloudgroup.binaural
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -29,10 +30,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.health.connect.client.PermissionController
 import com.blackcloudgroup.binaural.audio.ToneParams
 import com.blackcloudgroup.binaural.audio.parseSoundMode
 import com.blackcloudgroup.binaural.data.AppDatabase
 import com.blackcloudgroup.binaural.data.PresetEntity
+import com.blackcloudgroup.binaural.health.HealthConnectManager
 import com.blackcloudgroup.binaural.ui.LissajousVisualizer
 import com.blackcloudgroup.binaural.ui.PhoticEntrainmentCanvas
 import com.blackcloudgroup.binaural.ui.PresetDialog
@@ -45,6 +48,8 @@ class MainActivity : ComponentActivity() {
 
     private var audioService by mutableStateOf<BinauralAudioService?>(null)
     private var isBound by mutableStateOf(false)
+    // Set when Health Connect opens us to explain how its data is used (rationale / permission usage).
+    private var showPrivacyInfo by mutableStateOf(false)
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
@@ -80,6 +85,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val database = AppDatabase.getDatabase(this)
+        showPrivacyInfo = isPrivacyIntent(intent)
 
         setContent {
             MaterialTheme {
@@ -89,11 +95,25 @@ class MainActivity : ComponentActivity() {
                 ) {
                     MainAppContent(
                         audioService = audioService,
-                        database = database
+                        database = database,
+                        showPrivacyInfo = showPrivacyInfo,
+                        onDismissPrivacyInfo = { showPrivacyInfo = false }
                     )
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (isPrivacyIntent(intent)) showPrivacyInfo = true
+    }
+
+    private fun isPrivacyIntent(intent: Intent?): Boolean =
+        intent?.action == ACTION_SHOW_PERMISSIONS_RATIONALE || intent?.action == Intent.ACTION_VIEW_PERMISSION_USAGE
+
+    private companion object {
+        const val ACTION_SHOW_PERMISSIONS_RATIONALE = "androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE"
     }
 }
 
@@ -101,7 +121,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainAppContent(
     audioService: BinauralAudioService?,
-    database: AppDatabase
+    database: AppDatabase,
+    showPrivacyInfo: Boolean,
+    onDismissPrivacyInfo: () -> Unit
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -131,6 +153,67 @@ fun MainAppContent(
     var volume by rememberSaveable { mutableFloatStateOf(DEFAULT_VOLUME) }
     var pendingLargeExport by remember { mutableStateOf<PresetEntity?>(null) }
     var askedForNotifications by rememberSaveable { mutableStateOf(false) }
+    // Title of the last tapped preset; cleared by manual edits. Used as the Health Connect entry name.
+    var presetTitle by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val settings = remember { AppSettings(context) }
+    val healthConnect = remember { HealthConnectManager(context) }
+    var logToHealthConnect by remember { mutableStateOf(settings.logToHealthConnect) }
+    val healthStatusFlow = remember(audioService) {
+        audioService?.healthLogStatus ?: MutableStateFlow<HealthConnectManager.WriteResult?>(null)
+    }
+    val healthStatus by healthStatusFlow.collectAsState()
+
+    fun setHealthLogging(enabled: Boolean) {
+        settings.logToHealthConnect = enabled
+        logToHealthConnect = enabled
+    }
+
+    val healthPermissionLauncher = rememberLauncherForActivityResult(
+        PermissionController.createRequestPermissionResultContract()
+    ) { granted ->
+        if (granted.containsAll(healthConnect.requiredPermissions)) {
+            setHealthLogging(true)
+            Toast.makeText(context, "Sessions will be logged to Health Connect.", Toast.LENGTH_SHORT).show()
+        } else {
+            Log.w("MainActivity", "Health Connect permission not granted (got $granted)")
+            Toast.makeText(context, "Health Connect permission wasn't granted.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun enableHealthLogging() {
+        val availability = try {
+            healthConnect.availability()
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Health Connect availability check failed", e)
+            Toast.makeText(context, "Couldn't reach Health Connect: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+        when (availability) {
+            HealthConnectManager.Availability.Available -> coroutineScope.launch {
+                if (healthConnect.hasRequiredPermissions()) {
+                    setHealthLogging(true)
+                } else {
+                    healthPermissionLauncher.launch(healthConnect.requiredPermissions)
+                }
+            }
+            HealthConnectManager.Availability.NotInstalled,
+            HealthConnectManager.Availability.UpdateRequired -> {
+                Toast.makeText(context, "Install or update Health Connect to log sessions.", Toast.LENGTH_LONG).show()
+                try {
+                    context.startActivity(healthConnect.providerInstallIntent())
+                } catch (e: ActivityNotFoundException) {
+                    Log.w("MainActivity", "No Play Store to install Health Connect", e)
+                }
+            }
+            HealthConnectManager.Availability.MindfulnessUnsupported ->
+                Toast.makeText(
+                    context,
+                    "This Health Connect version can't store mindfulness sessions yet. Update it and try again.",
+                    Toast.LENGTH_LONG
+                ).show()
+        }
+    }
 
     // Android 13+: without this permission the foreground-service notification (and its Stop button)
     // is hidden from the shade. Playback still works, so a denial is logged, not blocking.
@@ -274,6 +357,7 @@ fun MainAppContent(
                 value = carrier,
                 onValueChange = {
                     carrier = it
+                    presetTitle = null
                     pushParams()
                 },
                 valueRange = 100f..500f
@@ -290,6 +374,7 @@ fun MainAppContent(
                     // Moving the beat by hand overrides the preset ramp (duration still applies).
                     beat = it
                     rampTargetBeat = null
+                    presetTitle = null
                     pushParams()
                 },
                 valueRange = 0.5f..40f
@@ -324,6 +409,18 @@ fun MainAppContent(
                 valueRange = 0f..1f
             )
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Log sessions to Health Connect")
+                Switch(
+                    checked = logToHealthConnect,
+                    onCheckedChange = { wantOn -> if (wantOn) enableHealthLogging() else setHealthLogging(false) }
+                )
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
 
             Row(
@@ -354,7 +451,8 @@ fun MainAppContent(
                         }
                         requestNotificationPermissionOnce()
                         service.setVolume(volume)
-                        when (val result = service.startSession(params)) {
+                        val title = presetTitle ?: "${soundMode.label()} session"
+                        when (val result = service.startSession(params, title)) {
                             SessionStartResult.Started -> Unit
                             SessionStartResult.AlreadyPlaying ->
                                 Log.w("MainActivity", "Start tapped while service reports a running session")
@@ -402,6 +500,19 @@ fun MainAppContent(
                 }
             }
 
+            healthStatus?.let { result ->
+                val (text, isError) = when (result) {
+                    HealthConnectManager.WriteResult.Written -> "Logged to Health Connect." to false
+                    is HealthConnectManager.WriteResult.Skipped -> "Not logged to Health Connect: ${result.reason}" to false
+                    is HealthConnectManager.WriteResult.Failed -> "Health Connect error: ${result.message}" to true
+                }
+                Text(
+                    text,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
             Spacer(modifier = Modifier.height(16.dp))
 
             Text(
@@ -424,6 +535,7 @@ fun MainAppContent(
                             durationMinutes = preset.durationMinutes
                             pinkNoise = preset.enablePinkNoise
                             soundMode = parseSoundMode(preset.soundMode)
+                            presetTitle = preset.title
                             // A new preset starts its ramp and duration from the beginning.
                             pushParams(restartTimeline = true)
                         }
@@ -483,6 +595,24 @@ fun MainAppContent(
                     }
                     showPresetDialog = false
                 }
+            )
+        }
+
+        if (showPrivacyInfo) {
+            AlertDialog(
+                onDismissRequest = onDismissPrivacyInfo,
+                title = { Text("How Black Cloud Binaural uses Health Connect") },
+                text = {
+                    Text(
+                        "If you turn on \"Log sessions to Health Connect\", each listening session of a minute or " +
+                            "longer is saved to Health Connect as a mindfulness session: its start and end time and " +
+                            "the preset name.\n\n" +
+                            "The app only writes this data. It does not read any Health Connect data, and nothing is " +
+                            "sent off your device by this app. You can turn logging off in the app, revoke access in " +
+                            "Health Connect settings, or delete the entries there at any time."
+                    )
+                },
+                confirmButton = { TextButton(onClick = onDismissPrivacyInfo) { Text("OK") } }
             )
         }
 
@@ -567,3 +697,9 @@ fun MainAppContent(
 }
 
 private const val DEFAULT_VOLUME = 0.2f
+
+private fun SoundMode.label(): String = when (this) {
+    SoundMode.HEMI_SYNC -> "Hemi-Sync"
+    SoundMode.BINAURAL -> "Binaural"
+    SoundMode.ISOCHRONIC -> "Isochronic"
+}

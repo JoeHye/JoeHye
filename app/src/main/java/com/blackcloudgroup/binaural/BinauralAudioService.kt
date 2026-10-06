@@ -26,9 +26,13 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.blackcloudgroup.binaural.audio.ToneGenerator
 import com.blackcloudgroup.binaural.audio.ToneParams
+import com.blackcloudgroup.binaural.health.HealthConnectManager
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.time.Duration
+import java.time.Instant
 
 enum class StopReason { USER, COMPLETED, FOCUS_LOSS, ERROR }
 
@@ -65,7 +69,19 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     private val _playbackState = MutableStateFlow<PlaybackState>(PlaybackState.Idle)
     val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
 
-    private class Session(val id: Long, val generator: ToneGenerator) {
+    /** Outcome of the most recent Health Connect write, for the UI to show; null until one happens. */
+    private val _healthLogStatus = MutableStateFlow<HealthConnectManager.WriteResult?>(null)
+    val healthLogStatus: StateFlow<HealthConnectManager.WriteResult?> = _healthLogStatus.asStateFlow()
+
+    private lateinit var settings: AppSettings
+    private lateinit var healthConnect: HealthConnectManager
+
+    private class Session(
+        val id: Long,
+        val generator: ToneGenerator,
+        val title: String,
+        val startedAt: Instant
+    ) {
         /** Cleared to abandon the session immediately (no fade), e.g. on service destroy. */
         @Volatile var running = true
         /** First stop reason wins; read by the audio thread when it reports back. */
@@ -89,6 +105,8 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
         super.onCreate()
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         mediaSession = MediaSessionCompat(this, "BinauralAudioService").apply { isActive = true }
+        settings = AppSettings(this)
+        healthConnect = HealthConnectManager(this)
         createNotificationChannel()
     }
 
@@ -113,7 +131,8 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     // Public API (main thread only)
     // ---------------------------------------------------------------------------------------------
 
-    fun startSession(params: ToneParams): SessionStartResult {
+    /** @param title shown in Health Connect if session logging is on (preset name or a generic label). */
+    fun startSession(params: ToneParams, title: String): SessionStartResult {
         if (!isMainThread()) {
             Log.e(TAG, "startSession called off the main thread")
             return SessionStartResult.Failed("Internal error: startSession must be called on the main thread")
@@ -154,7 +173,7 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
 
         acquireWakeLock(params)
         val generator = ToneGenerator(params, SAMPLE_RATE).apply { setVolume(effectiveVolume()) }
-        val newSession = Session(++nextSessionId, generator)
+        val newSession = Session(++nextSessionId, generator, title, Instant.now())
         session = newSession
 
         val (track, framesPerChunk) = trackAndFrames
@@ -282,6 +301,31 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
         releasePlaybackResources()
         _playbackState.value = PlaybackState.Stopped(reason, message)
         Log.i(TAG, "Session ${s.id} ended: $reason${message?.let { " ($it)" } ?: ""}")
+        logToHealthConnect(s)
+    }
+
+    /** Records what actually played, whatever ended it (completed, stopped, interrupted, error). */
+    private fun logToHealthConnect(s: Session) {
+        if (!settings.logToHealthConnect) return
+        val endedAt = Instant.now()
+        val played = Duration.between(s.startedAt, endedAt)
+        if (played < HealthConnectManager.MIN_LOGGED_SESSION) {
+            Log.d(TAG, "Session ${s.id} lasted ${played.seconds}s; too short to log to Health Connect")
+            return
+        }
+        val manager = healthConnect
+        HealthConnectManager.writeScope.launch {
+            val result = manager.writeMindfulnessSession(
+                startTime = s.startedAt,
+                endTime = endedAt,
+                title = s.title,
+                clientRecordId = "binaural-session-${s.startedAt.toEpochMilli()}"
+            )
+            if (result !is HealthConnectManager.WriteResult.Written) {
+                Log.w(TAG, "Session ${s.id} not logged to Health Connect: $result")
+            }
+            _healthLogStatus.value = result
+        }
     }
 
     private fun releasePlaybackResources() {
