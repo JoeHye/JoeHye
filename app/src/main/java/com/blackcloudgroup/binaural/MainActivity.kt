@@ -1,15 +1,20 @@
 package com.blackcloudgroup.binaural
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -22,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.blackcloudgroup.binaural.audio.ToneParams
 import com.blackcloudgroup.binaural.audio.parseSoundMode
@@ -34,7 +40,6 @@ import com.blackcloudgroup.binaural.util.WavExporter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -120,6 +125,71 @@ fun MainAppContent(
     var pinkNoise by rememberSaveable { mutableStateOf(true) }
     var soundMode by rememberSaveable { mutableStateOf(SoundMode.HEMI_SYNC) }
     var enablePhotic by rememberSaveable { mutableStateOf(false) }
+    var showPhoticWarning by remember { mutableStateOf(false) }
+    // Linear output gain sent to the service; Android's media volume still applies on top of it.
+    var volume by rememberSaveable { mutableFloatStateOf(DEFAULT_VOLUME) }
+    var pendingLargeExport by remember { mutableStateOf<PresetEntity?>(null) }
+    var askedForNotifications by rememberSaveable { mutableStateOf(false) }
+
+    // Android 13+: without this permission the foreground-service notification (and its Stop button)
+    // is hidden from the shade. Playback still works, so a denial is logged, not blocking.
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (!granted) {
+            Log.w("MainActivity", "POST_NOTIFICATIONS denied; playback notification will be hidden")
+            Toast.makeText(
+                context,
+                "Notifications are off, so the playback controls won't show in the notification shade.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    fun requestNotificationPermissionOnce() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || askedForNotifications) return
+        val granted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            askedForNotifications = true
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    fun shareExport(outFile: java.io.File) {
+        try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", outFile)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "audio/wav"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "Share WAV export"))
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to share exported WAV", e)
+            Toast.makeText(context, "Exported to ${outFile.name}, but sharing failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun startExport(preset: PresetEntity) {
+        exportInProgress = true
+        Toast.makeText(context, "Exporting ${preset.title}…", Toast.LENGTH_SHORT).show()
+        coroutineScope.launch {
+            try {
+                val outFile = WavExporter.exportToWav(preset, WavExporter.exportFileFor(context, preset))
+                shareExport(outFile)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                Log.i("MainActivity", "WAV export cancelled for '${preset.title}'")
+                throw e
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Failed to export WAV file", e)
+                Toast.makeText(context, "Export failed: ${e.localizedMessage ?: "Unknown error"}", Toast.LENGTH_LONG).show()
+            } finally {
+                exportInProgress = false
+            }
+        }
+    }
     var showPresetDialog by remember { mutableStateOf(false) }
     var presetToDelete by remember { mutableStateOf<PresetEntity?>(null) }
     var exportInProgress by remember { mutableStateOf(false) }
@@ -231,8 +301,28 @@ fun MainAppContent(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("Photic Light Flashing")
-                Switch(checked = enablePhotic, onCheckedChange = { enablePhotic = it })
+                Switch(
+                    checked = enablePhotic,
+                    onCheckedChange = { wantOn ->
+                        // Turning on always goes through the photosensitivity warning.
+                        if (wantOn) showPhoticWarning = true else enablePhotic = false
+                    }
+                )
             }
+
+            Text("Volume: ${(volume * 100).toInt()}%")
+            Slider(
+                value = volume,
+                onValueChange = {
+                    volume = it
+                    try {
+                        audioService?.setVolume(it)
+                    } catch (e: IllegalArgumentException) {
+                        Log.w("MainActivity", "Rejected volume $it: ${e.message}")
+                    }
+                },
+                valueRange = 0f..1f
+            )
 
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -262,6 +352,8 @@ fun MainAppContent(
                             Toast.makeText(context, "Invalid settings: ${e.message}", Toast.LENGTH_LONG).show()
                             return@Button
                         }
+                        requestNotificationPermissionOnce()
+                        service.setVolume(volume)
                         when (val result = service.startSession(params)) {
                             SessionStartResult.Started -> Unit
                             SessionStartResult.AlreadyPlaying ->
@@ -354,41 +446,10 @@ fun MainAppContent(
                                 IconButton(
                                     enabled = !exportInProgress,
                                     onClick = {
-                                        exportInProgress = true
-                                        Toast.makeText(context, "Exporting ${preset.title}…", Toast.LENGTH_SHORT).show()
-                                        coroutineScope.launch {
-                                            try {
-                                                val outFile = WavExporter.exportToWav(
-                                                    preset,
-                                                    WavExporter.exportFileFor(context, preset)
-                                                )
-                                                withContext(Dispatchers.Main) {
-                                                    try {
-                                                        val uri = FileProvider.getUriForFile(
-                                                            context,
-                                                            "${context.packageName}.fileprovider",
-                                                            outFile
-                                                        )
-                                                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                                            type = "audio/wav"
-                                                            putExtra(Intent.EXTRA_STREAM, uri)
-                                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                        }
-                                                        context.startActivity(Intent.createChooser(shareIntent, "Share WAV export"))
-                                                    } catch (e: Exception) {
-                                                        Log.e("MainActivity", "Failed to share exported WAV", e)
-                                                        Toast.makeText(context, "Exported to ${outFile.name}, but sharing failed", Toast.LENGTH_SHORT).show()
-                                                    }
-                                                }
-                                            } catch (e: kotlinx.coroutines.CancellationException) {
-                                                Log.i("MainActivity", "WAV export cancelled for '${preset.title}'")
-                                                throw e
-                                            } catch (e: Exception) {
-                                                Log.e("MainActivity", "Failed to export WAV file", e)
-                                                Toast.makeText(context, "Export failed: ${e.localizedMessage ?: "Unknown error"}", Toast.LENGTH_LONG).show()
-                                            } finally {
-                                                exportInProgress = false
-                                            }
+                                        if (WavExporter.estimatedSizeBytes(preset) > WavExporter.LARGE_EXPORT_BYTES) {
+                                            pendingLargeExport = preset
+                                        } else {
+                                            startExport(preset)
                                         }
                                     }
                                 ) {
@@ -425,6 +486,54 @@ fun MainAppContent(
             )
         }
 
+        if (showPhoticWarning) {
+            AlertDialog(
+                onDismissRequest = { showPhoticWarning = false },
+                title = { Text("Photosensitivity warning") },
+                text = {
+                    Text(
+                        "Photic mode flashes the whole screen at the beat frequency (up to 40 times a second). " +
+                            "Flashing light in this range can trigger seizures in people with photosensitive " +
+                            "epilepsy, including people who have never had a seizure before.\n\n" +
+                            "Do not use it if you or anyone who can see the screen has epilepsy or a history of " +
+                            "seizures. Stop immediately if you feel dizzy, disoriented or unwell."
+                    )
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        enablePhotic = true
+                        showPhoticWarning = false
+                    }) { Text("I understand, turn on") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showPhoticWarning = false }) { Text("Cancel") }
+                }
+            )
+        }
+
+        pendingLargeExport?.let { preset ->
+            val sizeMb = WavExporter.estimatedSizeBytes(preset) / (1024 * 1024)
+            AlertDialog(
+                onDismissRequest = { pendingLargeExport = null },
+                title = { Text("Large export") },
+                text = {
+                    Text(
+                        "\"${preset.title}\" is ${preset.durationMinutes} minutes, so the WAV file will be about " +
+                            "$sizeMb MB. Exporting can take a while, and some apps refuse files this large when sharing."
+                    )
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        pendingLargeExport = null
+                        startExport(preset)
+                    }) { Text("Export") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingLargeExport = null }) { Text("Cancel") }
+                }
+            )
+        }
+
         presetToDelete?.let { preset ->
             AlertDialog(
                 onDismissRequest = { presetToDelete = null },
@@ -456,3 +565,5 @@ fun MainAppContent(
         }
     }
 }
+
+private const val DEFAULT_VOLUME = 0.2f

@@ -24,6 +24,16 @@ object WavExporter {
     private const val EXPORT_VOLUME = 0.2f
     private const val CHUNK_FRAMES = 4096
     private const val STALE_EXPORT_AGE_MS = 60 * 60 * 1000L
+    private const val WAV_HEADER_BYTES = 44L
+    /** Keep this much free on top of the export so filling the cache can't starve the rest of the app. */
+    private const val FREE_SPACE_MARGIN_BYTES = 50L * 1024 * 1024
+
+    /** Above this, the UI asks for confirmation before exporting. */
+    const val LARGE_EXPORT_BYTES = 100L * 1024 * 1024
+
+    /** Exact size of the WAV [exportToWav] would write for [preset] (16-bit stereo, 44.1 kHz). */
+    fun estimatedSizeBytes(preset: PresetEntity): Long =
+        SAMPLE_RATE.toLong() * preset.durationMinutes * 60 * NUM_CHANNELS * (BITS_PER_SAMPLE / 8) + WAV_HEADER_BYTES
 
     /** Cache-dir file for [preset]; the title is sanitized so it can't escape the directory or break share targets. */
     fun exportFileFor(context: Context, preset: PresetEntity): File {
@@ -58,6 +68,15 @@ object WavExporter {
 
         val dir = outputFile.parentFile ?: throw IOException("Output file has no parent directory: $outputFile")
         deleteStaleExports(dir, keep = outputFile)
+
+        val needed = dataSize + WAV_HEADER_BYTES + FREE_SPACE_MARGIN_BYTES
+        val available = dir.usableSpace
+        if (available < needed) {
+            throw IOException(
+                "Not enough free storage: export needs ${needed / (1024 * 1024)} MB, " +
+                    "${available / (1024 * 1024)} MB available"
+            )
+        }
 
         val partFile = File(dir, outputFile.name + ".part")
         try {
