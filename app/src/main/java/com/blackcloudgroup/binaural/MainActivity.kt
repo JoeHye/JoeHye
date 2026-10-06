@@ -300,283 +300,291 @@ fun MainAppContent(
     Box(modifier = Modifier.fillMaxSize()) {
         PhoticEntrainmentCanvas(beatFreqHz = beat.toDouble(), isEnabled = enablePhotic && isPlaying)
 
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp)
-        ) {
-            Text(
-                text = "Black Cloud Binaural",
-                style = MaterialTheme.typography.headlineMedium,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-
-            LissajousVisualizer(
-                carrierHz = carrier.toDouble(),
-                beatHz = beat.toDouble(),
-                isPlaying = isPlaying
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Sound Mode Controls
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
-                FilterChip(
-                    selected = soundMode == SoundMode.HEMI_SYNC,
-                    onClick = {
-                        soundMode = SoundMode.HEMI_SYNC
-                        pushParams()
-                    },
-                    label = { Text("Hemi-Sync") }
-                )
-                FilterChip(
-                    selected = soundMode == SoundMode.BINAURAL,
-                    onClick = {
-                        soundMode = SoundMode.BINAURAL
-                        pushParams()
-                    },
-                    label = { Text("Binaural") }
-                )
-                FilterChip(
-                    selected = soundMode == SoundMode.ISOCHRONIC,
-                    onClick = {
-                        soundMode = SoundMode.ISOCHRONIC
-                        pushParams()
-                    },
-                    label = { Text("Isochronic") }
-                )
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Text("Carrier Frequency: ${carrier.toInt()} Hz")
-            Slider(
-                value = carrier,
-                onValueChange = {
-                    carrier = it
-                    presetTitle = null
-                    pushParams()
-                },
-                valueRange = 100f..500f
-            )
-
-            Text(
-                "Binaural Beat: ${String.format("%.1f", beat)} Hz" +
-                    (rampTargetBeat?.let { " → ${String.format("%.1f", it)} Hz" } ?: "") +
-                    (if (durationMinutes > 0) " over $durationMinutes min" else "")
-            )
-            Slider(
-                value = beat,
-                onValueChange = {
-                    // Moving the beat by hand overrides the preset ramp (duration still applies).
-                    beat = it
-                    rampTargetBeat = null
-                    presetTitle = null
-                    pushParams()
-                },
-                valueRange = 0.5f..40f
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Photic Light Flashing")
-                Switch(
-                    checked = enablePhotic,
-                    onCheckedChange = { wantOn ->
-                        // Turning on always goes through the photosensitivity warning.
-                        if (wantOn) showPhoticWarning = true else enablePhotic = false
-                    }
-                )
-            }
-
-            Text("Volume: ${(volume * 100).toInt()}%")
-            Slider(
-                value = volume,
-                onValueChange = {
-                    volume = it
-                    try {
-                        audioService?.setVolume(it)
-                    } catch (e: IllegalArgumentException) {
-                        Log.w("MainActivity", "Rejected volume $it: ${e.message}")
-                    }
-                },
-                valueRange = 0f..1f
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Log sessions to Health Connect")
-                Switch(
-                    checked = logToHealthConnect,
-                    onCheckedChange = { wantOn -> if (wantOn) enableHealthLogging() else setHealthLogging(false) }
-                )
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    enabled = audioService != null,
-                    onClick = {
-                        val service = audioService
-                        if (service == null) {
-                            Log.w("MainActivity", "Playback toggle failed: Audio service is unbound.")
-                            Toast.makeText(context, "Audio service initializing...", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-
-                        if (isPlaying) {
-                            service.stopSession()
-                            return@Button
-                        }
-
-                        val params = try {
-                            currentParams()
-                        } catch (e: IllegalArgumentException) {
-                            Log.w("MainActivity", "Refusing to start with invalid parameters", e)
-                            Toast.makeText(context, "Invalid settings: ${e.message}", Toast.LENGTH_LONG).show()
-                            return@Button
-                        }
-                        requestNotificationPermissionOnce()
-                        service.setVolume(volume)
-                        val title = presetTitle ?: "${soundMode.label()} session"
-                        when (val result = service.startSession(params, title)) {
-                            SessionStartResult.Started -> Unit
-                            SessionStartResult.AlreadyPlaying ->
-                                Log.w("MainActivity", "Start tapped while service reports a running session")
-                            SessionStartResult.FocusDenied ->
-                                Toast.makeText(
-                                    context,
-                                    "Can't play right now — another app or a call is using audio.",
-                                    Toast.LENGTH_LONG
-                                ).show()
-                            is SessionStartResult.Failed -> {
-                                Log.e("MainActivity", "Session start failed: ${result.message}", result.cause)
-                                Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
-                            }
-                        }
-                    },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(
-                        if (audioService == null) "Connecting..." 
-                        else if (isPlaying) "Stop Session" 
-                        else "Start Session"
-                    )
-                }
-
-                OutlinedButton(onClick = { showPresetDialog = true }) {
-                    Text("Save Preset")
-                }
-            }
-
-            (playback as? PlaybackState.Stopped)?.let { stopped ->
-                val status = when (stopped.reason) {
-                    StopReason.USER -> null
-                    StopReason.COMPLETED -> "Session complete."
-                    StopReason.FOCUS_LOSS -> "Stopped: ${stopped.message ?: "audio focus lost"}"
-                    StopReason.ERROR -> "Playback error: ${stopped.message ?: "unknown"}"
-                }
-                if (status != null) {
-                    Text(
-                        status,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (stopped.reason == StopReason.ERROR) MaterialTheme.colorScheme.error
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
-                }
-            }
-
-            healthStatus?.let { result ->
-                val (text, isError) = when (result) {
-                    HealthConnectManager.WriteResult.Written -> "Logged to Health Connect." to false
-                    is HealthConnectManager.WriteResult.Skipped -> "Not logged to Health Connect: ${result.reason}" to false
-                    is HealthConnectManager.WriteResult.Failed -> "Health Connect error: ${result.message}" to true
-                }
-                Text(
-                    text,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = "Saved Presets",
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Everything scrolls except the bottom bar, so Start/Stop is always reachable
+            // regardless of screen height or the system font size.
             LazyColumn(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(presets) { preset ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        onClick = {
-                            carrier = preset.carrierHz.toFloat()
-                            beat = preset.startBeatHz.toFloat()
-                            rampTargetBeat = preset.targetBeatHz.toFloat().takeIf { it != beat }
-                            durationMinutes = preset.durationMinutes
-                            pinkNoise = preset.enablePinkNoise
-                            soundMode = parseSoundMode(preset.soundMode)
-                            presetTitle = preset.title
-                            // A new preset starts its ramp and duration from the beginning.
-                            pushParams(restartTimeline = true)
-                        }
-                    ) {
+                item {
+                    Column {
+                        Text(
+                            text = "Black Cloud Binaural",
+                            style = MaterialTheme.typography.headlineMedium,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+
+                        LissajousVisualizer(
+                            carrierHz = carrier.toDouble(),
+                            beatHz = beat.toDouble(),
+                            isPlaying = isPlaying
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Sound Mode Controls
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            FilterChip(
+                                selected = soundMode == SoundMode.HEMI_SYNC,
+                                onClick = {
+                                    soundMode = SoundMode.HEMI_SYNC
+                                    pushParams()
+                                },
+                                label = { Text("Hemi-Sync") }
+                            )
+                            FilterChip(
+                                selected = soundMode == SoundMode.BINAURAL,
+                                onClick = {
+                                    soundMode = SoundMode.BINAURAL
+                                    pushParams()
+                                },
+                                label = { Text("Binaural") }
+                            )
+                            FilterChip(
+                                selected = soundMode == SoundMode.ISOCHRONIC,
+                                onClick = {
+                                    soundMode = SoundMode.ISOCHRONIC
+                                    pushParams()
+                                },
+                                label = { Text("Isochronic") }
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Text("Carrier Frequency: ${carrier.toInt()} Hz")
+                        Slider(
+                            value = carrier,
+                            onValueChange = {
+                                carrier = it
+                                presetTitle = null
+                                pushParams()
+                            },
+                            valueRange = 100f..500f
+                        )
+
+                        Text(
+                            "Binaural Beat: ${String.format("%.1f", beat)} Hz" +
+                                (rampTargetBeat?.let { " → ${String.format("%.1f", it)} Hz" } ?: "") +
+                                (if (durationMinutes > 0) " over $durationMinutes min" else "")
+                        )
+                        Slider(
+                            value = beat,
+                            onValueChange = {
+                                // Moving the beat by hand overrides the preset ramp (duration still applies).
+                                beat = it
+                                rampTargetBeat = null
+                                presetTitle = null
+                                pushParams()
+                            },
+                            valueRange = 0.5f..40f
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(preset.title, style = MaterialTheme.typography.bodyLarge)
+                            Text("Photic Light Flashing")
+                            Switch(
+                                checked = enablePhotic,
+                                onCheckedChange = { wantOn ->
+                                    // Turning on always goes through the photosensitivity warning.
+                                    if (wantOn) showPhoticWarning = true else enablePhotic = false
+                                }
+                            )
+                        }
+
+                        Text("Volume: ${(volume * 100).toInt()}%")
+                        Slider(
+                            value = volume,
+                            onValueChange = {
+                                volume = it
+                                try {
+                                    audioService?.setVolume(it)
+                                } catch (e: IllegalArgumentException) {
+                                    Log.w("MainActivity", "Rejected volume $it: ${e.message}")
+                                }
+                            },
+                            valueRange = 0f..1f
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Log sessions to Health Connect")
+                            Switch(
+                                checked = logToHealthConnect,
+                                onCheckedChange = { wantOn -> if (wantOn) enableHealthLogging() else setHealthLogging(false) }
+                            )
+                        }
+                        (playback as? PlaybackState.Stopped)?.let { stopped ->
+                            val status = when (stopped.reason) {
+                                StopReason.USER -> null
+                                StopReason.COMPLETED -> "Session complete."
+                                StopReason.FOCUS_LOSS -> "Stopped: ${stopped.message ?: "audio focus lost"}"
+                                StopReason.ERROR -> "Playback error: ${stopped.message ?: "unknown"}"
+                            }
+                            if (status != null) {
                                 Text(
-                                    "${preset.soundMode} | ${preset.carrierHz}Hz Base | ${preset.startBeatHz}Hz Beat | ${preset.durationMinutes}m",
-                                    style = MaterialTheme.typography.bodySmall
+                                    status,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (stopped.reason == StopReason.ERROR) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 4.dp)
                                 )
                             }
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    enabled = !exportInProgress,
-                                    onClick = {
-                                        if (WavExporter.estimatedSizeBytes(preset) > WavExporter.LARGE_EXPORT_BYTES) {
-                                            pendingLargeExport = preset
-                                        } else {
-                                            startExport(preset)
-                                        }
-                                    }
-                                ) {
-                                    Text("WAV")
-                                }
+                        }
 
-                                IconButton(onClick = { presetToDelete = preset }) {
-                                    Icon(
-                                        imageVector = Icons.Default.Delete,
-                                        contentDescription = "Delete Preset",
-                                        tint = MaterialTheme.colorScheme.error
+                        healthStatus?.let { result ->
+                            val (text, isError) = when (result) {
+                                HealthConnectManager.WriteResult.Written -> "Logged to Health Connect." to false
+                                is HealthConnectManager.WriteResult.Skipped -> "Not logged to Health Connect: ${result.reason}" to false
+                                is HealthConnectManager.WriteResult.Failed -> "Health Connect error: ${result.message}" to true
+                            }
+                            Text(
+                                text,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Text(
+                            text = "Saved Presets",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                    }
+                }
+
+                    items(presets) { preset ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {
+                                carrier = preset.carrierHz.toFloat()
+                                beat = preset.startBeatHz.toFloat()
+                                rampTargetBeat = preset.targetBeatHz.toFloat().takeIf { it != beat }
+                                durationMinutes = preset.durationMinutes
+                                pinkNoise = preset.enablePinkNoise
+                                soundMode = parseSoundMode(preset.soundMode)
+                                presetTitle = preset.title
+                                // A new preset starts its ramp and duration from the beginning.
+                                pushParams(restartTimeline = true)
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(preset.title, style = MaterialTheme.typography.bodyLarge)
+                                    Text(
+                                        "${preset.soundMode} | ${preset.carrierHz}Hz Base | ${preset.startBeatHz}Hz Beat | ${preset.durationMinutes}m",
+                                        style = MaterialTheme.typography.bodySmall
                                     )
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(
+                                        enabled = !exportInProgress,
+                                        onClick = {
+                                            if (WavExporter.estimatedSizeBytes(preset) > WavExporter.LARGE_EXPORT_BYTES) {
+                                                pendingLargeExport = preset
+                                            } else {
+                                                startExport(preset)
+                                            }
+                                        }
+                                    ) {
+                                        Text("WAV")
+                                    }
+
+                                    IconButton(onClick = { presetToDelete = preset }) {
+                                        Icon(
+                                            imageVector = Icons.Default.Delete,
+                                            contentDescription = "Delete Preset",
+                                            tint = MaterialTheme.colorScheme.error
+                                        )
+                                    }
                                 }
                             }
                         }
+                    }
+            }
+
+            Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        enabled = audioService != null,
+                        onClick = {
+                            val service = audioService
+                            if (service == null) {
+                                Log.w("MainActivity", "Playback toggle failed: Audio service is unbound.")
+                                Toast.makeText(context, "Audio service initializing...", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+
+                            if (isPlaying) {
+                                service.stopSession()
+                                return@Button
+                            }
+
+                            val params = try {
+                                currentParams()
+                            } catch (e: IllegalArgumentException) {
+                                Log.w("MainActivity", "Refusing to start with invalid parameters", e)
+                                Toast.makeText(context, "Invalid settings: ${e.message}", Toast.LENGTH_LONG).show()
+                                return@Button
+                            }
+                            requestNotificationPermissionOnce()
+                            service.setVolume(volume)
+                            val title = presetTitle ?: "${soundMode.label()} session"
+                            when (val result = service.startSession(params, title)) {
+                                SessionStartResult.Started -> Unit
+                                SessionStartResult.AlreadyPlaying ->
+                                    Log.w("MainActivity", "Start tapped while service reports a running session")
+                                SessionStartResult.FocusDenied ->
+                                    Toast.makeText(
+                                        context,
+                                        "Can't play right now — another app or a call is using audio.",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                is SessionStartResult.Failed -> {
+                                    Log.e("MainActivity", "Session start failed: ${result.message}", result.cause)
+                                    Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(
+                            if (audioService == null) "Connecting..." 
+                            else if (isPlaying) "Stop Session" 
+                            else "Start Session"
+                        )
+                    }
+
+                    OutlinedButton(onClick = { showPresetDialog = true }) {
+                        Text("Save Preset")
                     }
                 }
             }
