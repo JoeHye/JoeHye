@@ -34,6 +34,7 @@ import androidx.health.connect.client.PermissionController
 import com.blackcloudgroup.binaural.audio.ToneParams
 import com.blackcloudgroup.binaural.audio.parseSoundMode
 import com.blackcloudgroup.binaural.data.AppDatabase
+import com.blackcloudgroup.binaural.data.DefaultPresets
 import com.blackcloudgroup.binaural.data.PresetEntity
 import com.blackcloudgroup.binaural.health.HealthConnectManager
 import com.blackcloudgroup.binaural.ui.LissajousVisualizer
@@ -238,6 +239,22 @@ fun MainAppContent(
         if (!granted) {
             askedForNotifications = true
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    fun restoreDefaultPresets() {
+        coroutineScope.launch {
+            try {
+                val added = database.presetDao().restoreMissingDefaults(DefaultPresets.all)
+                val message = if (added == 0) "All default presets are already in your list."
+                else "Added $added default preset${if (added == 1) "" else "s"}."
+                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Failed to restore default presets", e)
+                Toast.makeText(context, "Couldn't restore presets: ${e.message}", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -460,11 +477,19 @@ fun MainAppContent(
 
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        Text(
-                            text = "Saved Presets",
-                            style = MaterialTheme.typography.titleMedium,
-                            modifier = Modifier.padding(bottom = 8.dp)
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Saved Presets",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            TextButton(onClick = { restoreDefaultPresets() }) {
+                                Text("Restore defaults")
+                            }
+                        }
                     }
                 }
 

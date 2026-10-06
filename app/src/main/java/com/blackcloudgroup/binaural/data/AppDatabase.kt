@@ -36,13 +36,12 @@ abstract class AppDatabase : RoomDatabase() {
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """.trimIndent()
 
-            val defaults = listOf(
-                arrayOf<Any>("Theta Deep Meditation", 6.0, 6.0, 136.1, 20, "HEMI_SYNC", 1),
-                arrayOf<Any>("Schumann Earth Resonance", 7.83, 7.83, 144.0, 30, "HEMI_SYNC", 1),
-                arrayOf<Any>("Deep Sleep Ramp (Alpha → Delta)", 10.0, 2.5, 174.0, 45, "HEMI_SYNC", 1),
-                arrayOf<Any>("Lucid Dreaming Gateway", 4.0, 4.0, 210.0, 30, "BINAURAL", 0),
-                arrayOf<Any>("Flow State / Active Focus", 14.0, 14.0, 200.0, 25, "ISOCHRONIC", 0)
-            )
+            val defaults = DefaultPresets.all.map { p ->
+                arrayOf<Any>(
+                    p.title, p.startBeatHz, p.targetBeatHz, p.carrierHz, p.durationMinutes,
+                    p.soundMode, if (p.enablePinkNoise) 1 else 0
+                )
+            }
 
             var seeded = 0
             for (preset in defaults) {
