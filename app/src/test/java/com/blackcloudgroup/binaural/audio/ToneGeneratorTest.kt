@@ -103,6 +103,26 @@ class ToneGeneratorTest {
     }
 
     @Test
+    fun pause_fadesToSilenceThenResumesSmoothly() {
+        val gen = ToneGenerator(ToneParams(200.0, 6.0, soundMode = SoundMode.BINAURAL), sampleRate)
+        gen.setVolume(1f)
+        val before = renderAll(gen, sampleRate)
+        gen.setPaused(true)
+        val fadeOut = renderAll(gen, (ToneGenerator.PAUSE_FADE_SECONDS * sampleRate).toInt() + 10)
+        assertTrue("Should report silenced after the pause fade", gen.isSilencedForPause)
+        assertTrue("Tail of pause fade should be silent", abs(fadeOut.first.last().toInt()) == 0)
+
+        gen.setPaused(false)
+        assertFalse(gen.isSilencedForPause)
+        val resumed = renderAll(gen, sampleRate / 2)
+        val bound = (2 * PI * 205.0 / sampleRate * Short.MAX_VALUE * 1.2).toInt()
+        val stitched = ShortArray(resumed.first.size + 1).also { fadeOut.first.last().let { v -> it[0] = v }; resumed.first.copyInto(it, 1) }
+        assertTrue("Resume should not click", maxStep(stitched) <= bound)
+        assertTrue("Should be audible again after resume", resumed.first.takeLast(1000).any { abs(it.toInt()) > 10_000 })
+        assertFalse(before.first.isEmpty())
+    }
+
+    @Test
     fun hemiSyncAtFullVolume_clampsInsteadOfWrapping() {
         val gen = ToneGenerator(
             ToneParams(200.0, 6.0, soundMode = SoundMode.HEMI_SYNC, pinkNoise = true),

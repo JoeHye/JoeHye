@@ -53,6 +53,7 @@ class ToneGenerator(
     @Volatile private var pendingTimelineRestart = false
     @Volatile private var targetGain = 0.2
     @Volatile private var stopFadeFramesRequested = -1L
+    @Volatile private var pauseRequested = false
 
     // ---- Audio-thread-only state below ----
     private var params = initialParams
@@ -82,6 +83,15 @@ class ToneGenerator(
     var clippedSamples = 0L
         private set
 
+    // Pause fades to silence and back instead of cutting, so pausing never clicks.
+    private var pauseGain = 1.0
+    private val pauseStep = 1.0 / (PAUSE_FADE_SECONDS * sampleRate)
+
+    /** True once a requested pause has fully faded out; the caller can stop rendering until resumed. */
+    val isSilencedForPause: Boolean get() = pauseRequested && pauseGain <= 0.0
+
+    val isStopRequested: Boolean get() = stopFadeFramesRequested > 0
+
     var isFinished = false
         private set
 
@@ -103,6 +113,11 @@ class ToneGenerator(
     }
 
     /** Fade out over [fadeMillis] and then finish. Safe to call repeatedly; the first call wins. */
+    /** Fade out ([paused] = true) or back in. Safe from any thread; the session timeline keeps its place. */
+    fun setPaused(paused: Boolean) {
+        pauseRequested = paused
+    }
+
     fun requestStop(fadeMillis: Int) {
         require(fadeMillis >= 0) { "fadeMillis must be >= 0" }
         if (stopFadeFramesRequested < 0) {
@@ -124,6 +139,7 @@ class ToneGenerator(
         val isIsochronic = p.soundMode == SoundMode.ISOCHRONIC
         val addPink = isHemiSync && p.pinkNoise
         val gainTarget = targetGain
+        val pausing = pauseRequested
         val sr = sampleRate.toDouble()
         val harmonicCarrier = p.carrierHz * 1.5
 
@@ -160,7 +176,8 @@ class ToneGenerator(
             }
 
             gain += (gainTarget - gain) * gainSmoothing
-            var envelope = gain
+            pauseGain = if (pausing) maxOf(0.0, pauseGain - pauseStep) else minOf(1.0, pauseGain + pauseStep)
+            var envelope = gain * pauseGain
             if (totalFrames > 0) {
                 val remaining = totalFrames - elapsedFrames
                 if (remaining < endFadeFrames) envelope *= remaining.toDouble() / endFadeFrames
@@ -229,6 +246,7 @@ class ToneGenerator(
         private const val TWO_PI = 2.0 * PI
         private const val PINK_LEVEL = 0.02
         const val SESSION_END_FADE_SECONDS = 3.0
+        const val PAUSE_FADE_SECONDS = 0.25
 
         /** Edge fade for isochronic pulses. Hard 0/1 gating produces a broadband click on every edge. */
         private const val ISOCHRONIC_EDGE_SECONDS = 0.005

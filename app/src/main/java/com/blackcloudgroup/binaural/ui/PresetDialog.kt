@@ -1,34 +1,44 @@
 package com.blackcloudgroup.binaural.ui
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.blackcloudgroup.binaural.SoundMode
+import com.blackcloudgroup.binaural.audio.parseSoundMode
 import com.blackcloudgroup.binaural.data.PresetEntity
 
 @Composable
+/**
+ * Create or edit a preset. [initial] pre-fills every field; its id is kept on save, so editing
+ * an existing preset (id != 0) replaces it in place instead of adding a copy.
+ */
 fun PresetDialog(
+    initial: PresetEntity,
+    isEdit: Boolean,
     onDismiss: () -> Unit,
     onSave: (PresetEntity) -> Unit
 ) {
-    var title by remember { mutableStateOf("") }
-    var carrier by remember { mutableFloatStateOf(200f) }
-    var startBeat by remember { mutableFloatStateOf(10f) }
-    var targetBeat by remember { mutableFloatStateOf(2f) }
-    var duration by remember { mutableIntStateOf(20) }
-    var selectedMode by remember { mutableStateOf(SoundMode.HEMI_SYNC) }
-    var enablePinkNoise by remember { mutableStateOf(true) }
+    var title by remember { mutableStateOf(initial.title) }
+    var carrier by remember { mutableFloatStateOf(initial.carrierHz.toFloat().coerceIn(100f, 500f)) }
+    var startBeat by remember { mutableFloatStateOf(initial.startBeatHz.toFloat().coerceIn(0.5f, 40f)) }
+    var targetBeat by remember { mutableFloatStateOf(initial.targetBeatHz.toFloat().coerceIn(0.5f, 40f)) }
+    var duration by remember { mutableIntStateOf(initial.durationMinutes.coerceIn(1, 60)) }
+    var selectedMode by remember { mutableStateOf(parseSoundMode(initial.soundMode)) }
+    var enablePinkNoise by remember { mutableStateOf(initial.enablePinkNoise) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Save Custom Preset") },
+        title = { Text(if (isEdit) "Edit Preset" else "Save Preset") },
         text = {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -106,7 +116,7 @@ fun PresetDialog(
             Button(
                 enabled = title.isNotBlank(),
                 onClick = {
-                    val newPreset = PresetEntity(
+                    val newPreset = initial.copy(
                         title = title.trim(),
                         startBeatHz = startBeat.toDouble(),
                         targetBeatHz = targetBeat.toDouble(),

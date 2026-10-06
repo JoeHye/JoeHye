@@ -18,11 +18,14 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -41,7 +44,9 @@ import com.blackcloudgroup.binaural.data.PresetEntity
 import com.blackcloudgroup.binaural.health.HealthConnectManager
 import com.blackcloudgroup.binaural.ui.LissajousVisualizer
 import com.blackcloudgroup.binaural.ui.PhoticEntrainmentCanvas
+import com.blackcloudgroup.binaural.ui.BinauralTheme
 import com.blackcloudgroup.binaural.ui.PresetDialog
+import com.blackcloudgroup.binaural.util.rememberHeadphonesConnected
 import com.blackcloudgroup.binaural.util.WavExporter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -87,18 +92,26 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // targetSdk 35+ always draws edge-to-edge. The Compose theme is always light, so force dark
-        // system-bar icons; the automatic style would pick light icons in system dark mode and
-        // make them invisible on our light background.
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
-        )
         val database = AppDatabase.getDatabase(this)
+        val settings = AppSettings(this)
         showPrivacyInfo = isPrivacyIntent(intent)
 
         setContent {
-            MaterialTheme {
+            var themeMode by remember { mutableStateOf(settings.themeMode) }
+            val darkTheme = when (themeMode) {
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+            }
+            // targetSdk 35+ always draws edge-to-edge. Match the system-bar icons to the app theme,
+            // not the system one, or they disappear when the two differ (e.g. app forced to light).
+            DisposableEffect(darkTheme) {
+                val transparent = android.graphics.Color.TRANSPARENT
+                val style = if (darkTheme) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
+                enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+                onDispose { }
+            }
+            BinauralTheme(darkTheme = darkTheme) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
@@ -107,7 +120,12 @@ class MainActivity : ComponentActivity() {
                         audioService = audioService,
                         database = database,
                         showPrivacyInfo = showPrivacyInfo,
-                        onDismissPrivacyInfo = { showPrivacyInfo = false }
+                        onDismissPrivacyInfo = { showPrivacyInfo = false },
+                        themeMode = themeMode,
+                        onThemeModeChange = {
+                            themeMode = it
+                            settings.themeMode = it
+                        }
                     )
                 }
             }
@@ -133,7 +151,9 @@ fun MainAppContent(
     audioService: BinauralAudioService?,
     database: AppDatabase,
     showPrivacyInfo: Boolean,
-    onDismissPrivacyInfo: () -> Unit
+    onDismissPrivacyInfo: () -> Unit,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -148,6 +168,10 @@ fun MainAppContent(
     }
     val playback by playbackFlow.collectAsState()
     val isPlaying = playback is PlaybackState.Playing
+    val isPaused = playback is PlaybackState.Paused
+    // A session exists (playing or paused): parameters still apply and Stop is available.
+    val isActive = isPlaying || isPaused
+    val headphonesConnected = rememberHeadphonesConnected()
 
     var carrier by rememberSaveable { mutableFloatStateOf(200f) }
     var beat by rememberSaveable { mutableFloatStateOf(6f) }
@@ -300,7 +324,9 @@ fun MainAppContent(
             }
         }
     }
-    var showPresetDialog by remember { mutableStateOf(false) }
+    // Preset being created/edited in the dialog (id 0 = new) and whether it's an edit; null = closed.
+    var presetDialog by remember { mutableStateOf<Pair<PresetEntity, Boolean>?>(null) }
+    var showHeadphoneWarning by remember { mutableStateOf(false) }
     var presetToDelete by remember { mutableStateOf<PresetEntity?>(null) }
 
     fun currentParams() = ToneParams(
@@ -315,13 +341,66 @@ fun MainAppContent(
     /** Push the UI's parameters to a running session; invalid combinations are logged and skipped. */
     fun pushParams(restartTimeline: Boolean = false) {
         val service = audioService ?: return
-        if (!isPlaying) return
+        if (!isActive) return
         try {
             service.updateParams(currentParams(), restartTimeline)
         } catch (e: IllegalArgumentException) {
             Log.w("MainActivity", "Not applying invalid parameters: ${e.message}")
         }
     }
+
+    fun showStartResult(result: SessionStartResult) {
+        when (result) {
+            SessionStartResult.Started -> Unit
+            SessionStartResult.AlreadyPlaying ->
+                Log.w("MainActivity", "Start/resume tapped while the service reports a running session")
+            SessionStartResult.FocusDenied ->
+                Toast.makeText(context, "Can't play right now — another app or a call is using audio.", Toast.LENGTH_LONG).show()
+            is SessionStartResult.Failed -> {
+                Log.e("MainActivity", "Session start failed: ${result.message}", result.cause)
+                Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun startPlayback() {
+        val service = audioService
+        if (service == null) {
+            Log.w("MainActivity", "Start failed: audio service is unbound.")
+            Toast.makeText(context, "Audio service initializing...", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val params = try {
+            currentParams()
+        } catch (e: IllegalArgumentException) {
+            Log.w("MainActivity", "Refusing to start with invalid parameters", e)
+            Toast.makeText(context, "Invalid settings: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+        requestNotificationPermissionOnce()
+        service.setVolume(volume)
+        val title = presetTitle ?: "${soundMode.label()} session"
+        showStartResult(service.startSession(params, title))
+    }
+
+    /** Binaural and Hemi-Sync need a separate signal per ear; warn before playing them on a speaker. */
+    fun onStartTapped() {
+        if (soundMode != SoundMode.ISOCHRONIC && !headphonesConnected) {
+            showHeadphoneWarning = true
+        } else {
+            startPlayback()
+        }
+    }
+
+    fun newPresetFromCurrentSettings() = PresetEntity(
+        title = "",
+        startBeatHz = beat.toDouble(),
+        targetBeatHz = (rampTargetBeat ?: beat).toDouble(),
+        carrierHz = carrier.toDouble(),
+        durationMinutes = if (durationMinutes > 0) durationMinutes else 20,
+        soundMode = soundMode.name,
+        enablePinkNoise = pinkNoise
+    )
 
     Box(modifier = Modifier.fillMaxSize()) {
         PhoticEntrainmentCanvas(beatFreqHz = beat.toDouble(), isEnabled = enablePhotic && isPlaying)
@@ -387,6 +466,25 @@ fun MainAppContent(
                                 },
                                 label = { Text("Isochronic") }
                             )
+                        }
+
+                        if (soundMode != SoundMode.ISOCHRONIC && !headphonesConnected) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "No headphones detected. ${soundMode.label()} needs headphones to work.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = {
+                                    soundMode = SoundMode.ISOCHRONIC
+                                    presetTitle = null
+                                    pushParams()
+                                }) { Text("Use Isochronic") }
+                            }
                         }
 
                         Spacer(modifier = Modifier.height(12.dp))
@@ -459,6 +557,20 @@ fun MainAppContent(
                                 onCheckedChange = { wantOn -> if (wantOn) enableHealthLogging() else setHealthLogging(false) }
                             )
                         }
+                        (playback as? PlaybackState.Paused)?.let { paused ->
+                            Text(
+                                when (paused.reason) {
+                                    PauseReason.USER -> "Paused."
+                                    PauseReason.INTERRUPTION -> "Paused for a call or notification. Resumes automatically."
+                                    PauseReason.OTHER_APP -> "Paused because another app started playing audio."
+                                    PauseReason.HEADPHONES_DISCONNECTED -> "Paused: headphones disconnected."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+
                         (playback as? PlaybackState.Stopped)?.let { stopped ->
                             val status = when (stopped.reason) {
                                 StopReason.USER -> null
@@ -537,31 +649,69 @@ fun MainAppContent(
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                 }
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    IconButton(
-                                        enabled = !exportInProgress,
-                                        onClick = {
-                                            if (WavExporter.estimatedSizeBytes(preset) > WavExporter.LARGE_EXPORT_BYTES) {
-                                                pendingLargeExport = preset
-                                            } else {
-                                                startExport(preset)
-                                            }
-                                        }
-                                    ) {
-                                        Text("WAV")
+                                var menuOpen by remember { mutableStateOf(false) }
+                                Box {
+                                    IconButton(onClick = { menuOpen = true }) {
+                                        Icon(Icons.Default.MoreVert, contentDescription = "More options for ${preset.title}")
                                     }
-
-                                    IconButton(onClick = { presetToDelete = preset }) {
-                                        Icon(
-                                            imageVector = Icons.Default.Delete,
-                                            contentDescription = "Delete Preset",
-                                            tint = MaterialTheme.colorScheme.error
+                                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                        DropdownMenuItem(
+                                            text = { Text("Edit") },
+                                            leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                                            onClick = {
+                                                menuOpen = false
+                                                presetDialog = preset to true
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text(if (exportInProgress) "Exporting…" else "Export audio (WAV)") },
+                                            enabled = !exportInProgress,
+                                            onClick = {
+                                                menuOpen = false
+                                                if (WavExporter.estimatedSizeBytes(preset) > WavExporter.LARGE_EXPORT_BYTES) {
+                                                    pendingLargeExport = preset
+                                                } else {
+                                                    startExport(preset)
+                                                }
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                                            leadingIcon = {
+                                                Icon(Icons.Default.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                                            },
+                                            onClick = {
+                                                menuOpen = false
+                                                presetToDelete = preset
+                                            }
                                         )
                                     }
                                 }
                             }
                         }
                     }
+
+                item {
+                    Column(modifier = Modifier.padding(top = 16.dp)) {
+                        Text("Appearance", style = MaterialTheme.typography.titleMedium)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf(
+                                ThemeMode.SYSTEM to "System",
+                                ThemeMode.LIGHT to "Light",
+                                ThemeMode.DARK to "Night"
+                            ).forEach { (mode, label) ->
+                                FilterChip(
+                                    selected = themeMode == mode,
+                                    onClick = { onThemeModeChange(mode) },
+                                    label = { Text(label) }
+                                )
+                            }
+                        }
+                    }
+                }
             }
 
             Surface(tonalElevation = 3.dp, shadowElevation = 3.dp) {
@@ -573,75 +723,87 @@ fun MainAppContent(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Button(
-                        enabled = audioService != null,
-                        onClick = {
-                            val service = audioService
-                            if (service == null) {
-                                Log.w("MainActivity", "Playback toggle failed: Audio service is unbound.")
-                                Toast.makeText(context, "Audio service initializing...", Toast.LENGTH_SHORT).show()
-                                return@Button
-                            }
-
-                            if (isPlaying) {
-                                service.stopSession()
-                                return@Button
-                            }
-
-                            val params = try {
-                                currentParams()
-                            } catch (e: IllegalArgumentException) {
-                                Log.w("MainActivity", "Refusing to start with invalid parameters", e)
-                                Toast.makeText(context, "Invalid settings: ${e.message}", Toast.LENGTH_LONG).show()
-                                return@Button
-                            }
-                            requestNotificationPermissionOnce()
-                            service.setVolume(volume)
-                            val title = presetTitle ?: "${soundMode.label()} session"
-                            when (val result = service.startSession(params, title)) {
-                                SessionStartResult.Started -> Unit
-                                SessionStartResult.AlreadyPlaying ->
-                                    Log.w("MainActivity", "Start tapped while service reports a running session")
-                                SessionStartResult.FocusDenied ->
-                                    Toast.makeText(
-                                        context,
-                                        "Can't play right now — another app or a call is using audio.",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                is SessionStartResult.Failed -> {
-                                    Log.e("MainActivity", "Session start failed: ${result.message}", result.cause)
-                                    Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
-                                }
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(
-                            if (audioService == null) "Connecting..." 
-                            else if (isPlaying) "Stop Session" 
-                            else "Start Session"
-                        )
+                    if (!isActive) {
+                        Button(
+                            enabled = audioService != null,
+                            onClick = { onStartTapped() },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (audioService == null) "Connecting..." else "Start Session")
+                        }
+                    } else {
+                        Button(
+                            onClick = {
+                                val service = audioService ?: return@Button
+                                if (isPaused) showStartResult(service.resumeSession())
+                                else service.pauseSession(PauseReason.USER)
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (isPaused) "Resume" else "Pause")
+                        }
+                        OutlinedButton(onClick = { audioService?.stopSession() }) {
+                            Text("Stop")
+                        }
                     }
 
-                    OutlinedButton(onClick = { showPresetDialog = true }) {
-                        Text("Save Preset")
+                    OutlinedButton(onClick = { presetDialog = newPresetFromCurrentSettings() to false }) {
+                        Text(if (isActive) "Save" else "Save Preset")
                     }
                 }
             }
         }
 
-        if (showPresetDialog) {
+        presetDialog?.let { (initial, isEdit) ->
             PresetDialog(
-                onDismiss = { showPresetDialog = false },
-                onSave = { newPreset ->
-                    coroutineScope.launch(Dispatchers.IO) {
+                initial = initial,
+                isEdit = isEdit,
+                onDismiss = { presetDialog = null },
+                onSave = { preset ->
+                    presetDialog = null
+                    coroutineScope.launch {
                         try {
-                            database.presetDao().insertPreset(newPreset)
+                            // REPLACE on the same id updates an edited preset in place.
+                            database.presetDao().insertPreset(preset)
+                            if (isEdit && presetTitle == initial.title) presetTitle = preset.title
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
                         } catch (e: Exception) {
-                            Log.e("MainActivity", "Failed to insert custom preset", e)
+                            Log.e("MainActivity", "Failed to save preset '${preset.title}'", e)
+                            Toast.makeText(context, "Couldn't save preset: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
-                    showPresetDialog = false
+                }
+            )
+        }
+
+        if (showHeadphoneWarning) {
+            AlertDialog(
+                onDismissRequest = { showHeadphoneWarning = false },
+                title = { Text("No headphones detected") },
+                text = {
+                    Text(
+                        "Binaural and Hemi-Sync beats only work when each ear hears its own tone, so they " +
+                            "need headphones. Through a speaker you'll just hear a steady hum.\n\n" +
+                            "Isochronic mode pulses the sound itself and works on speakers."
+                    )
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        showHeadphoneWarning = false
+                        soundMode = SoundMode.ISOCHRONIC
+                        presetTitle = null
+                        startPlayback()
+                    }) { Text("Use Isochronic") }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = { showHeadphoneWarning = false }) { Text("Cancel") }
+                        TextButton(onClick = {
+                            showHeadphoneWarning = false
+                            startPlayback()
+                        }) { Text("Play anyway") }
+                    }
                 }
             )
         }

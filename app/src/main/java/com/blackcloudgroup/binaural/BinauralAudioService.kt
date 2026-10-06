@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -20,10 +22,13 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.Process
+import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.blackcloudgroup.binaural.audio.ToneGenerator
 import com.blackcloudgroup.binaural.audio.ToneParams
 import com.blackcloudgroup.binaural.health.HealthConnectManager
@@ -36,9 +41,20 @@ import java.time.Instant
 
 enum class StopReason { USER, COMPLETED, FOCUS_LOSS, ERROR }
 
+enum class PauseReason {
+    USER,
+    /** Call or notification; resumes by itself when it ends. */
+    INTERRUPTION,
+    /** Another app took over audio; the user resumes manually. */
+    OTHER_APP,
+    /** Headphones unplugged or disconnected; avoids suddenly playing out of the speaker. */
+    HEADPHONES_DISCONNECTED
+}
+
 sealed interface PlaybackState {
     object Idle : PlaybackState
     data class Playing(val params: ToneParams) : PlaybackState
+    data class Paused(val params: ToneParams, val reason: PauseReason) : PlaybackState
     data class Stopped(val reason: StopReason, val message: String? = null) : PlaybackState
 }
 
@@ -80,8 +96,20 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
         val id: Long,
         val generator: ToneGenerator,
         val title: String,
-        val startedAt: Instant
+        val startedAt: Instant,
+        initialParams: ToneParams
     ) {
+        /** Main-thread view of the current parameters, for state updates and resume. */
+        var params: ToneParams = initialParams
+        var pauseReason: PauseReason? = null
+        /** Set by a transient focus loss so focus regain resumes; a user pause clears it. */
+        var resumeOnFocusGain = false
+        var pausedSince: Instant? = null
+        var pausedTotal: Duration = Duration.ZERO
+        /** Audio thread waits on this while paused. */
+        val pauseLock = Object()
+        @Volatile var paused = false
+
         /** Cleared to abandon the session immediately (no fade), e.g. on service destroy. */
         @Volatile var running = true
         /** First stop reason wins; read by the audio thread when it reports back. */
@@ -95,6 +123,27 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     private var volume = DEFAULT_VOLUME
     private var isDucked = false
 
+    /** Pauses when headphones are unplugged/disconnected so audio doesn't jump to the speaker. */
+    private val noisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                Log.i(TAG, "Audio becoming noisy (headphones disconnected); pausing")
+                pauseSession(PauseReason.HEADPHONES_DISCONNECTED)
+            }
+        }
+    }
+    private var noisyReceiverRegistered = false
+
+    /** Headset buttons, Bluetooth controls and the lock screen arrive here. */
+    private val mediaCallback = object : MediaSessionCompat.Callback() {
+        override fun onPlay() {
+            if (session?.paused == true) resumeSession()
+            else Log.d(TAG, "Media play ignored: nothing paused")
+        }
+        override fun onPause() = pauseSession(PauseReason.USER)
+        override fun onStop() = stopSession(StopReason.USER)
+    }
+
     inner class LocalBinder : Binder() {
         fun getService(): BinauralAudioService = this@BinauralAudioService
     }
@@ -104,7 +153,11 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     override fun onCreate() {
         super.onCreate()
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        mediaSession = MediaSessionCompat(this, "BinauralAudioService").apply { isActive = true }
+        mediaSession = MediaSessionCompat(this, "BinauralAudioService").apply {
+            setCallback(mediaCallback, mainHandler)
+            isActive = true
+        }
+        updateMediaSession()
         settings = AppSettings(this)
         healthConnect = HealthConnectManager(this)
         createNotificationChannel()
@@ -115,6 +168,11 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
             intent?.action == ACTION_STOP -> {
                 Log.i(TAG, "Stop requested from notification")
                 stopSession(StopReason.USER)
+            }
+            intent?.action == ACTION_PAUSE -> pauseSession(PauseReason.USER)
+            intent?.action == ACTION_RESUME -> {
+                val result = resumeSession()
+                if (result != SessionStartResult.Started) Log.w(TAG, "Resume from notification failed: $result")
             }
             session == null -> {
                 // Started without an active session (e.g. a stale start after the session already ended).
@@ -173,13 +231,16 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
 
         acquireWakeLock(params)
         val generator = ToneGenerator(params, SAMPLE_RATE).apply { setVolume(effectiveVolume()) }
-        val newSession = Session(++nextSessionId, generator, title, Instant.now())
+        val newSession = Session(++nextSessionId, generator, title, Instant.now(), params)
         session = newSession
 
         val (track, framesPerChunk) = trackAndFrames
         Thread({ runAudioLoop(newSession, track, framesPerChunk) }, "BinauralSynth-${newSession.id}").start()
 
+        registerNoisyReceiver()
         _playbackState.value = PlaybackState.Playing(params)
+        updateMediaSession()
+        updateNotification()
         Log.i(TAG, "Session ${newSession.id} started: $params")
         return SessionStartResult.Started
     }
@@ -196,6 +257,7 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
             s.stopMessage = message
         }
         s.generator.requestStop(STOP_FADE_MS)
+        synchronized(s.pauseLock) { s.pauseLock.notifyAll() } // a paused audio thread exits right away
 
         // Watchdog: if the audio thread doesn't report back (e.g. write() wedged on a dead route),
         // release focus/wake lock/foreground on our side anyway. The thread still owns the track
@@ -216,7 +278,60 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     fun updateParams(params: ToneParams, restartTimeline: Boolean = false) {
         val s = session ?: return
         s.generator.loadParams(params, restartTimeline)
-        _playbackState.value = PlaybackState.Playing(params)
+        s.params = params
+        val reason = s.pauseReason
+        _playbackState.value = if (s.paused && reason != null) PlaybackState.Paused(params, reason) else PlaybackState.Playing(params)
+    }
+
+    /** Fades to silence and holds the session (timeline, ramp position) until [resumeSession]. */
+    fun pauseSession(reason: PauseReason = PauseReason.USER) {
+        if (!isMainThread()) {
+            mainHandler.post { pauseSession(reason) }
+            return
+        }
+        val s = session ?: return
+        if (s.generator.isStopRequested) return
+        if (s.paused) {
+            // A user pause during an interruption means "stay paused" once the call ends.
+            if (reason == PauseReason.USER) {
+                s.resumeOnFocusGain = false
+                s.pauseReason = PauseReason.USER
+                _playbackState.value = PlaybackState.Paused(s.params, PauseReason.USER)
+            }
+            return
+        }
+        s.paused = true
+        s.pauseReason = reason
+        s.resumeOnFocusGain = reason == PauseReason.INTERRUPTION
+        s.pausedSince = Instant.now()
+        s.generator.setPaused(true)
+        releaseWakeLock()
+        _playbackState.value = PlaybackState.Paused(s.params, reason)
+        updateMediaSession()
+        updateNotification()
+        Log.i(TAG, "Session ${s.id} paused: $reason")
+    }
+
+    fun resumeSession(): SessionStartResult {
+        if (!isMainThread()) return SessionStartResult.Failed("Internal error: resumeSession must be called on the main thread")
+        val s = session ?: return SessionStartResult.Failed("Nothing to resume")
+        if (!s.paused) return SessionStartResult.AlreadyPlaying
+        // After a permanent focus loss we no longer hold focus and must ask again.
+        if (focusRequest == null && !requestAudioFocus()) return SessionStartResult.FocusDenied
+
+        s.pausedSince?.let { s.pausedTotal = s.pausedTotal.plus(Duration.between(it, Instant.now())) }
+        s.pausedSince = null
+        s.paused = false
+        s.pauseReason = null
+        s.resumeOnFocusGain = false
+        s.generator.setPaused(false)
+        synchronized(s.pauseLock) { s.pauseLock.notifyAll() }
+        acquireWakeLock(s.params)
+        _playbackState.value = PlaybackState.Playing(s.params)
+        updateMediaSession()
+        updateNotification()
+        Log.i(TAG, "Session ${s.id} resumed")
+        return SessionStartResult.Started
     }
 
     /** Output volume 0..1. Throws IllegalArgumentException outside that range. */
@@ -237,6 +352,15 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
             track.play()
             val buffer = ShortArray(framesPerChunk * 2)
             while (s.running) {
+                if (s.generator.isSilencedForPause && !s.generator.isStopRequested) {
+                    // Faded out for a pause: stop feeding the track and wait for resume or stop.
+                    track.pause()
+                    synchronized(s.pauseLock) {
+                        while (s.running && s.paused && !s.generator.isStopRequested) s.pauseLock.wait(PAUSE_POLL_MS)
+                    }
+                    if (!s.running || s.generator.isStopRequested) break // already silent, no fade needed
+                    track.play()
+                }
                 val frames = s.generator.render(buffer, framesPerChunk)
                 if (frames == 0) break // duration reached or stop fade finished
                 if (!writeFully(s, track, buffer, frames * 2)) break
@@ -298,8 +422,10 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
             return
         }
         session = null
+        s.pausedSince?.let { s.pausedTotal = s.pausedTotal.plus(Duration.between(it, Instant.now())) }
         releasePlaybackResources()
         _playbackState.value = PlaybackState.Stopped(reason, message)
+        updateMediaSession()
         Log.i(TAG, "Session ${s.id} ended: $reason${message?.let { " ($it)" } ?: ""}")
         logToHealthConnect(s)
     }
@@ -308,7 +434,7 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     private fun logToHealthConnect(s: Session) {
         if (!settings.logToHealthConnect) return
         val endedAt = Instant.now()
-        val played = Duration.between(s.startedAt, endedAt)
+        val played = Duration.between(s.startedAt, endedAt).minus(s.pausedTotal)
         if (played < HealthConnectManager.MIN_LOGGED_SESSION) {
             Log.d(TAG, "Session ${s.id} lasted ${played.seconds}s; too short to log to Health Connect")
             return
@@ -329,6 +455,7 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     }
 
     private fun releasePlaybackResources() {
+        unregisterNoisyReceiver()
         releaseWakeLock()
         abandonAudioFocus()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -340,10 +467,12 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
             Log.w(TAG, "Service destroyed with session ${s.id} still active; abandoning without fade")
             s.stopReason = s.stopReason ?: StopReason.USER
             s.running = false // audio thread exits after its current write and releases the track
+            synchronized(s.pauseLock) { s.pauseLock.notifyAll() }
             session = null
             releaseWakeLock()
             abandonAudioFocus()
         }
+        unregisterNoisyReceiver()
         mainHandler.removeCallbacksAndMessages(null)
         mediaSession.release()
         super.onDestroy()
@@ -390,10 +519,15 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
 
     override fun onAudioFocusChange(focusChange: Int) {
         when (focusChange) {
-            AudioManager.AUDIOFOCUS_LOSS ->
-                stopSession(StopReason.FOCUS_LOSS, "Another app started playing audio")
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ->
-                stopSession(StopReason.FOCUS_LOSS, "Interrupted (call or notification)")
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                // Focus is gone for good; resuming must request it again.
+                pauseSession(PauseReason.OTHER_APP)
+                abandonAudioFocus()
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                // Don't let a call override an explicit user pause.
+                if (session?.paused != true) pauseSession(PauseReason.INTERRUPTION)
+            }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 isDucked = true
                 session?.generator?.setVolume(effectiveVolume())
@@ -401,6 +535,10 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
             AudioManager.AUDIOFOCUS_GAIN -> {
                 isDucked = false
                 session?.generator?.setVolume(effectiveVolume())
+                if (session?.resumeOnFocusGain == true) {
+                    Log.i(TAG, "Interruption over; resuming")
+                    resumeSession()
+                }
             }
             else -> Log.d(TAG, "Unhandled audio focus change: $focusChange")
         }
@@ -480,24 +618,104 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     }
 
     private fun createNotification(): Notification {
+        val s = session
+        val paused = s?.paused == true
         val openApp = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val stop = PendingIntent.getService(
-            this, 1,
-            Intent(this, BinauralAudioService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        val toggle = if (paused) {
+            NotificationCompat.Action(android.R.drawable.ic_media_play, "Resume", serviceIntent(ACTION_RESUME, 2))
+        } else {
+            NotificationCompat.Action(android.R.drawable.ic_media_pause, "Pause", serviceIntent(ACTION_PAUSE, 3))
+        }
+        val stop = NotificationCompat.Action(
+            android.R.drawable.ic_menu_close_clear_cancel, "Stop", serviceIntent(ACTION_STOP, 1)
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Black Cloud Group | Binaural Session")
-            .setContentText("Hemi-Sync & brainwave entrainment engine active")
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(s?.title ?: "Black Cloud Binaural")
+            .setContentText(if (paused) pausedText(s?.pauseReason) else "Playing")
+            .setSmallIcon(if (paused) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
             .setContentIntent(openApp)
-            .addAction(android.R.drawable.ic_media_pause, "Stop", stop)
-            .setOngoing(true)
+            .addAction(toggle)
+            .addAction(stop)
+            .setStyle(
+                androidx.media.app.NotificationCompat.MediaStyle()
+                    .setMediaSession(mediaSession.sessionToken)
+                    .setShowActionsInCompactView(0, 1)
+            )
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .setOngoing(!paused)
             .build()
+    }
+
+    private fun pausedText(reason: PauseReason?): String = when (reason) {
+        PauseReason.INTERRUPTION -> "Paused for a call or notification; resumes automatically"
+        PauseReason.OTHER_APP -> "Paused because another app is playing audio"
+        PauseReason.HEADPHONES_DISCONNECTED -> "Paused: headphones disconnected"
+        PauseReason.USER, null -> "Paused"
+    }
+
+    private fun serviceIntent(action: String, requestCode: Int): PendingIntent = PendingIntent.getService(
+        this, requestCode,
+        Intent(this, BinauralAudioService::class.java).setAction(action),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    /** Re-posts the foreground notification so its Pause/Resume button and text match the state. */
+    private fun updateNotification() {
+        if (session == null) return
+        try {
+            getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, createNotification())
+        } catch (e: SecurityException) {
+            // POST_NOTIFICATIONS denied: the update is dropped; playback is unaffected.
+            Log.w(TAG, "Could not update playback notification", e)
+        }
+    }
+
+    /** Keeps headset/Bluetooth/lock-screen controls in step with what is actually happening. */
+    private fun updateMediaSession() {
+        val s = session
+        val state = when {
+            s == null -> PlaybackStateCompat.STATE_STOPPED
+            s.paused -> PlaybackStateCompat.STATE_PAUSED
+            else -> PlaybackStateCompat.STATE_PLAYING
+        }
+        mediaSession.setPlaybackState(
+            PlaybackStateCompat.Builder()
+                .setActions(
+                    PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or
+                        PlaybackStateCompat.ACTION_PLAY_PAUSE or PlaybackStateCompat.ACTION_STOP
+                )
+                .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, if (state == PlaybackStateCompat.STATE_PLAYING) 1f else 0f)
+                .build()
+        )
+        mediaSession.setMetadata(
+            MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, s?.title ?: "Black Cloud Binaural")
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, "Black Cloud Binaural")
+                .build()
+        )
+    }
+
+    private fun registerNoisyReceiver() {
+        if (noisyReceiverRegistered) return
+        ContextCompat.registerReceiver(
+            this, noisyReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY), ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        noisyReceiverRegistered = true
+    }
+
+    private fun unregisterNoisyReceiver() {
+        if (!noisyReceiverRegistered) return
+        try {
+            unregisterReceiver(noisyReceiver)
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "Noisy receiver was not registered", e)
+        }
+        noisyReceiverRegistered = false
     }
 
     private fun isMainThread() = Looper.myLooper() == Looper.getMainLooper()
@@ -505,6 +723,8 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
     companion object {
         private const val TAG = "BinauralAudioService"
         const val ACTION_STOP = "com.blackcloudgroup.binaural.action.STOP"
+        const val ACTION_PAUSE = "com.blackcloudgroup.binaural.action.PAUSE"
+        const val ACTION_RESUME = "com.blackcloudgroup.binaural.action.RESUME"
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "binaural_channel"
@@ -513,6 +733,7 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
         private const val DUCK_FACTOR = 0.5f
         private const val STOP_FADE_MS = 250
         private const val STOP_WATCHDOG_MS = 1_500L
+        private const val PAUSE_POLL_MS = 250L
         private const val MAX_ZERO_WRITES = 50
         private const val WAKE_LOCK_SLACK_MS = 5 * 60 * 1000L
         private const val OPEN_ENDED_WAKE_LOCK_MS = 4 * 60 * 60 * 1000L
