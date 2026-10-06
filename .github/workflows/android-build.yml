@@ -19,22 +19,14 @@ jobs:
     permissions:
       contents: write   # needed to publish the latest-debug release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - uses: gradle/actions/setup-gradle@v4
-
-      # TEMPORARY diagnostic: list connect-client's opt-in annotations (remove once the build is green).
-      - name: List Health Connect experimental annotations
-        continue-on-error: true
-        run: |
-          curl -sSfL -o hc.aar https://dl.google.com/dl/android/maven2/androidx/health/connect/connect-client/1.1.0/connect-client-1.1.0.aar
-          unzip -o -q hc.aar classes.jar -d hc
-          unzip -l hc/classes.jar | grep -iE 'Experimental' || echo "no Experimental classes found"
 
       - name: Build debug APK and run unit tests
         run: ./gradlew assembleDebug testDebugUnitTest --stacktrace
