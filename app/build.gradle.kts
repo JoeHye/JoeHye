@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.blackcloudgroup.binaural"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.blackcloudgroup.binaural"
