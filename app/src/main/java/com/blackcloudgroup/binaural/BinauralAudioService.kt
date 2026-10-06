@@ -58,6 +58,9 @@ sealed interface PlaybackState {
     data class Stopped(val reason: StopReason, val message: String? = null) : PlaybackState
 }
 
+/** Snapshot for the UI; [totalSeconds] is 0 for an open-ended session. */
+data class SessionProgress(val elapsedSeconds: Int, val totalSeconds: Int, val currentBeatHz: Double)
+
 sealed interface SessionStartResult {
     object Started : SessionStartResult
     object AlreadyPlaying : SessionStartResult
@@ -332,6 +335,16 @@ class BinauralAudioService : Service(), AudioManager.OnAudioFocusChangeListener 
         updateNotification()
         Log.i(TAG, "Session ${s.id} resumed")
         return SessionStartResult.Started
+    }
+
+    /** Where the current session is (time played, current beat on the ramp); null when idle. */
+    fun currentProgress(): SessionProgress? {
+        val s = session ?: return null
+        return SessionProgress(
+            elapsedSeconds = s.generator.elapsedSeconds.toInt(),
+            totalSeconds = s.params.durationSeconds,
+            currentBeatHz = s.generator.currentBeatHz
+        )
     }
 
     /** Output volume 0..1. Throws IllegalArgumentException outside that range. */

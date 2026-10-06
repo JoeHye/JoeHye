@@ -97,6 +97,14 @@ class ToneGenerator(
 
     val framesRendered: Long get() = elapsedFrames
 
+    // Published once per render() for other threads (the UI's progress ring); read-only outside.
+    @Volatile var currentBeatHz: Double = initialParams.startBeatHz
+        private set
+    @Volatile private var publishedFrames = 0L
+
+    /** Session time played so far (excludes pauses: nothing renders while paused). */
+    val elapsedSeconds: Double get() = publishedFrames.toDouble() / sampleRate
+
     /**
      * Swap in new parameters. With [restartTimeline] the ramp and duration start over (e.g. a new
      * preset was picked); otherwise the session keeps its elapsed time (e.g. a slider moved).
@@ -144,11 +152,13 @@ class ToneGenerator(
         val harmonicCarrier = p.carrierHz * 1.5
 
         var frame = 0
+        var lastBeat = currentBeatHz
         while (frame < maxFrames) {
             if (totalFrames > 0 && elapsedFrames >= totalFrames) { isFinished = true; break }
             if (stopFadeRemaining == 0L) { isFinished = true; break }
 
             val beat = currentBeat(p)
+            lastBeat = beat
             val halfBeat = beat / 2.0
 
             var left = sin(TWO_PI * phaseL1)
@@ -192,6 +202,8 @@ class ToneGenerator(
             frame++
             elapsedFrames++
         }
+        currentBeatHz = lastBeat
+        publishedFrames = elapsedFrames
         return frame
     }
 
